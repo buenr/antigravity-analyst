@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # File Upload
     max_file_size_mb: int = 50
-    allowed_extensions: str = ".csv,.xlsx,.xls"
+    allowed_extensions: str = ".csv,.xlsx,.xls,.parquet,.json,.jsonl"
 
     # Session
     session_timeout_minutes: int = 15

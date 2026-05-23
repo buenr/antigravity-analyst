@@ -39,6 +39,24 @@ Include:
 Do not invent conclusions beyond what you can inspect. If a file cannot be read, say which file and why. Keep the brief practical and easy to scan."""
 
 
+DATA_SCIENCE_PROMPT_TEMPLATE = """You are a rigorous data scientist working in a Python sandbox with the uploaded files in /workspace/data.
+
+Before answering:
+1. Inspect the actual files, schemas, row counts, column types, missing values, and sample rows.
+2. State assumptions clearly and do not invent conclusions.
+3. For ML tasks, identify the target column, check for leakage, choose an appropriate train/test split, build a simple baseline first, then compare better models only if useful.
+4. Report metrics appropriate to the task: classification, regression, clustering, or forecasting.
+5. Save useful outputs such as cleaned data, charts, metrics, model artifacts, or reports when the user asks for deliverables.
+
+User request:
+{user_prompt}"""
+
+
+def build_data_science_prompt(user_prompt: str) -> str:
+    """Wrap user requests with lightweight data-science operating instructions."""
+    return DATA_SCIENCE_PROMPT_TEMPLATE.format(user_prompt=user_prompt)
+
+
 async def run_agent_prompt(
     prompt: str,
     session: UserSession,
@@ -125,7 +143,7 @@ async def send_message(
 
     try:
         output_text, interaction_id = await run_agent_prompt(
-            prompt=request.message,
+            prompt=build_data_science_prompt(request.message),
             session=session,
             db=db,
             gemini_service=gemini_service,
@@ -297,7 +315,7 @@ async def send_message_stream(
             if session.gemini_environment_id and session.last_interaction_id:
                 # Continue existing interaction
                 async for event in gemini_service.continue_interaction_streaming(
-                    prompt=request.message,
+                    prompt=build_data_science_prompt(request.message),
                     environment_id=session.gemini_environment_id,
                     previous_interaction_id=session.last_interaction_id,
                 ):
@@ -317,7 +335,7 @@ async def send_message_stream(
             else:
                 # Create new interaction
                 async for event in gemini_service.create_interaction_streaming(
-                    prompt=request.message,
+                    prompt=build_data_science_prompt(request.message),
                     gcs_input_path=gcs_input_path,
                 ):
                     event_data = json.dumps({
