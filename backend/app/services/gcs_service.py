@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import Optional
 
 from google.auth import default
+from google.auth.transport.requests import Request
 from google.cloud import storage
 from google.cloud.storage import Blob
 
@@ -30,6 +31,7 @@ class GCSService:
 
         self.client = storage.Client(project=self.project_id)
         self.bucket = self.client.bucket(self.bucket_name)
+        self.credentials = self.client._credentials
 
     def _get_session_path(self, tenant_id: str, user_id: str, session_id: str) -> str:
         """Generate the GCS path for a session."""
@@ -91,7 +93,13 @@ class GCSService:
     ) -> str:
         """Get the GCS input folder path for mounting to sandbox."""
         base_path = self._get_session_path(tenant_id, user_id, session_id)
-        return f"gs://{self.bucket_name}/{base_path}/input/"
+        return f"gs://{self.bucket_name}/{base_path}/input"
+
+    def get_access_token(self) -> str:
+        """Get an OAuth access token for private GCS source mounts."""
+        if not self.credentials.valid:
+            self.credentials.refresh(Request())
+        return self.credentials.token
 
     def download_file(self, gcs_path: str) -> bytes:
         """Download a file from GCS."""

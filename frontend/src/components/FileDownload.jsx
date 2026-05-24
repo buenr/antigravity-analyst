@@ -53,13 +53,9 @@ export default function FileDownload({ sessionId }) {
   };
 
   const handleDownload = (fileName) => {
-    const url = `/api/chat/${sessionId}/reports/${fileName}`;
+    const url = `/api/chat/${sessionId}/reports/${encodeURIComponent(fileName)}`;
     window.open(url, '_blank');
   };
-
-  if (reports.length === 0 && !loading) {
-    return null;
-  }
 
   return (
     <div className="space-y-3">
@@ -84,6 +80,14 @@ export default function FileDownload({ sessionId }) {
       {loading ? (
         <div className="text-center py-4 text-gray-500">
           Loading reports...
+        </div>
+      ) : reports.length === 0 ? (
+        <div className="text-center py-8 text-gray-500">
+          <FileText className="w-10 h-10 mx-auto mb-3 text-gray-300" />
+          <p>No downloadable reports found yet.</p>
+          <p className="text-sm mt-1">
+            Ask the agent to create a file, then refresh this tab.
+          </p>
         </div>
       ) : (
         <ul className="space-y-2">

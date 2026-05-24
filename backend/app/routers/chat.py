@@ -28,6 +28,27 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
 
 
+REPORT_EXTENSIONS = (
+    ".pdf",
+    ".html",
+    ".htm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".csv",
+    ".xlsx",
+    ".xls",
+    ".json",
+    ".md",
+    ".pptx",
+    ".ppt",
+    ".docx",
+    ".txt",
+    ".tar.gz",
+    ".zip",
+)
+
+
 ANALYST_BRIEF_PROMPT = """You are a careful data analyst. Inspect the uploaded files mounted at /workspace/data and write a concise first-pass analyst brief.
 
 Include:
@@ -57,6 +78,73 @@ def build_data_science_prompt(user_prompt: str) -> str:
     return DATA_SCIENCE_PROMPT_TEMPLATE.format(user_prompt=user_prompt)
 
 
+def is_downloadable_report(filename: str) -> bool:
+    """Return whether a file should appear in the generated reports list."""
+    lower_name = filename.lower()
+    return lower_name.endswith(REPORT_EXTENSIONS)
+
+
+def content_type_for_filename(filename: str) -> str:
+    """Return a useful content type for browser downloads."""
+    lower_name = filename.lower()
+    if lower_name.endswith(".tar.gz"):
+        return "application/gzip"
+
+    ext = os.path.splitext(filename)[1].lower()
+    content_types = {
+        ".pdf": "application/pdf",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".csv": "text/csv",
+        ".json": "application/json",
+        ".md": "text/markdown",
+        ".txt": "text/plain",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".zip": "application/zip",
+    }
+    return content_types.get(ext, "application/octet-stream")
+
+
+async def harvest_workspace_files(session, gemini_service, gcs_service) -> int:
+    """Copy downloadable files from the Gemini workspace snapshot into GCS output."""
+    if not session.gemini_environment_id:
+        return 0
+
+    tar_content = await gemini_service.download_workspace_snapshot(
+        session.gemini_environment_id
+    )
+
+    harvested_count = 0
+    with tarfile.open(fileobj=io.BytesIO(tar_content), mode="r:*") as tar:
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+
+            filename = os.path.basename(member.name)
+            if not filename or not is_downloadable_report(filename):
+                continue
+
+            f = tar.extractfile(member)
+            if not f:
+                continue
+
+            gcs_service.upload_to_path(
+                file_content=f.read(),
+                gcs_path=f"{session.gcs_folder_path}/output/{filename}",
+                content_type=content_type_for_filename(filename),
+            )
+            harvested_count += 1
+
+    return harvested_count
+
+
 async def run_agent_prompt(
     prompt: str,
     session: UserSession,
@@ -70,6 +158,7 @@ async def run_agent_prompt(
         user_id=str(session.user_id),
         session_id=str(session.session_id),
     )
+    gcs_token = gcs_service.get_access_token()
 
     output_text = ""
     interaction_id = None
@@ -89,6 +178,7 @@ async def run_agent_prompt(
         async for event in gemini_service.create_interaction_streaming(
             prompt=prompt,
             gcs_input_path=gcs_input_path,
+            gcs_token=gcs_token,
         ):
             if event.event_type == "complete":
                 output_text = event.message
@@ -304,6 +394,7 @@ async def send_message_stream(
         user_id=str(session.user_id),
         session_id=str(session.session_id),
     )
+    gcs_token = gcs_service.get_access_token()
 
     async def event_generator():
         """Generate SSE events from Gemini streaming response."""
@@ -337,6 +428,7 @@ async def send_message_stream(
                 async for event in gemini_service.create_interaction_streaming(
                     prompt=build_data_science_prompt(request.message),
                     gcs_input_path=gcs_input_path,
+                    gcs_token=gcs_token,
                 ):
                     event_data = json.dumps({
                         "event_type": event.event_type,
@@ -458,17 +550,18 @@ async def list_reports(
             detail=f"Session {session_id} not found",
         )
 
-    if not session.gemini_environment_id:
-        return ReportListResponse(session_id=session_id, reports=[])
+    if session.gemini_environment_id:
+        try:
+            await harvest_workspace_files(session, gemini_service, gcs_service)
+        except Exception as e:
+            logger.warning(f"Unable to refresh Gemini workspace reports: {str(e)}")
 
-    # List files in the output folder
     output_path = f"{session.gcs_folder_path}/output/"
     files = gcs_service.list_files(output_path)
 
     reports = []
     for f in files:
-        # Filter for report types
-        if any(f["name"].endswith(ext) for ext in [".pdf", ".html", ".png", ".jpg", ".csv"]):
+        if is_downloadable_report(f["name"]):
             reports.append(
                 DownloadResponse(
                     file_name=f["name"],
@@ -536,21 +629,9 @@ async def download_report(
             detail=f"Report {filename} not found",
         )
 
-    # Determine content type
-    ext = os.path.splitext(filename)[1].lower()
-    content_types = {
-        ".pdf": "application/pdf",
-        ".html": "text/html",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".csv": "text/csv",
-        ".json": "application/json",
-    }
-
     return StreamingResponse(
         io.BytesIO(content),
-        media_type=content_types.get(ext, "application/octet-stream"),
+        media_type=content_type_for_filename(filename),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -585,22 +666,13 @@ async def harvest_workspace(
             detail="No active Gemini environment for this session",
         )
 
-    # Download workspace snapshot
-    tar_content = await gemini_service.download_workspace_snapshot(
-        session.gemini_environment_id
+    harvested_count = await harvest_workspace_files(
+        session=session,
+        gemini_service=gemini_service,
+        gcs_service=gcs_service,
     )
 
-    # Extract and upload to GCS output folder
-    with tarfile.open(fileobj=io.BytesIO(tar_content), mode="r:*") as tar:
-        for member in tar.getmembers():
-            if member.isfile():
-                f = tar.extractfile(member)
-                if f:
-                    content = f.read()
-                    output_path = f"{session.gcs_folder_path}/output/{os.path.basename(member.name)}"
-                    gcs_service.upload_to_path(
-                        file_content=content,
-                        gcs_path=output_path,
-                    )
-
-    return {"status": "harvested", "message": "Workspace files saved to GCS"}
+    return {
+        "status": "harvested",
+        "message": f"{harvested_count} workspace files saved to GCS",
+    }
