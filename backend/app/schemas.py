@@ -60,6 +60,23 @@ class FileListResponse(BaseModel):
     files: List[FileInfo]
 
 
+# Download Schemas
+class DownloadResponse(BaseModel):
+    """Response with download information."""
+
+    file_name: str
+    download_url: str
+    file_type: str
+    size_bytes: int
+
+
+class ReportListResponse(BaseModel):
+    """Response listing available reports for download."""
+
+    session_id: uuid.UUID
+    reports: List[DownloadResponse]
+
+
 # Chat Schemas
 class ChatRequest(BaseModel):
     """Request to send a chat message."""
@@ -76,6 +93,10 @@ class ChatMessageResponse(BaseModel):
     role: str
     content: str
     created_at: datetime
+    attachments: List[DownloadResponse] = Field(
+        default_factory=list,
+        description="Downloadable deliverables produced for this turn",
+    )
 
     class Config:
         from_attributes = True
@@ -83,29 +104,16 @@ class ChatMessageResponse(BaseModel):
 
 # Progress/Streaming Schemas
 class ProgressEvent(BaseModel):
-    """SSE event for streaming progress updates."""
+    """SSE event for streaming progress updates.
+
+    On ``complete``, ``data`` may include ``interaction_id``, ``reports`` (list of
+    DownloadResponse dicts), and ``harvested_count``.
+    """
 
     event_type: str  # 'status', 'terminal', 'error', 'complete'
     message: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     data: Optional[dict] = None
-
-
-# Download Schemas
-class DownloadResponse(BaseModel):
-    """Response with download information."""
-
-    file_name: str
-    download_url: str
-    file_type: str
-    size_bytes: int
-
-
-class ReportListResponse(BaseModel):
-    """Response listing available reports for download."""
-
-    session_id: uuid.UUID
-    reports: List[DownloadResponse]
 
 
 # Error Schemas

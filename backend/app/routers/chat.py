@@ -4,9 +4,11 @@ import io
 import json
 import logging
 import os
+import re
 import tarfile
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -67,7 +69,14 @@ Before answering:
 2. State assumptions clearly and do not invent conclusions.
 3. For ML tasks, identify the target column, check for leakage, choose an appropriate train/test split, build a simple baseline first, then compare better models only if useful.
 4. Report metrics appropriate to the task: classification, regression, clustering, or forecasting.
-5. Save useful outputs such as cleaned data, charts, metrics, model artifacts, or reports when the user asks for deliverables.
+5. Save final requested deliverables inside a directory named `./outputs/` (relative to your current working directory).
+   - Create the `./outputs/` directory first if it does not exist.
+   - Always place the final user-facing files (e.g., a compiled PDF report, a PowerPoint presentation, or a final clean summary CSV) in `./outputs/`.
+   - Leave all raw plotting images, temporary cleanups, and scratchpad files in the root directory or `./tmp/`. Do not put intermediate building blocks in `./outputs/`.
+6. When the user asks for a downloadable artifact (PDF, chart image, export, etc.):
+   - Save it under `./outputs/` with a clear basename (e.g. `revenue_chart.png`, `analysis_report.pdf`).
+   - In your final answer, name each deliverable file exactly as saved (basename only).
+   - Do not invent URLs, session IDs, or download links; the application attaches download links automatically.
 
 User request:
 {user_prompt}"""
@@ -112,37 +121,262 @@ def content_type_for_filename(filename: str) -> str:
     return content_types.get(ext, "application/octet-stream")
 
 
+# User-facing deliverable extensions (only harvested from ./outputs/)
+OUTPUT_DELIVERABLE_EXTENSIONS = (
+    ".pdf",
+    ".pptx",
+    ".ppt",
+    ".docx",
+    ".xlsx",
+    ".xls",
+    ".zip",
+    ".tar.gz",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".csv",
+    ".json",
+    ".md",
+    ".txt",
+    ".html",
+    ".htm",
+)
+
+# Paths that commonly contain library assets, not user deliverables
+NOISE_PATH_FRAGMENTS = (
+    "site-packages",
+    "dist-packages",
+    "matplotlib",
+    "node_modules",
+    ".venv",
+    "venv/",
+    "/lib/python",
+    "/share/",
+)
+
+# Matplotlib ships toolbar icons as tiny PDFs; never show these as user deliverables
+EXCLUDED_REPORT_BASENAMES = frozenset(
+    {
+        "back.pdf",
+        "forward.pdf",
+        "filesave.pdf",
+        "hand.pdf",
+        "help.pdf",
+        "home.pdf",
+        "matplotlib.pdf",
+        "move.pdf",
+        "qt4_editor_options.pdf",
+        "subplots.pdf",
+        "zoom_to_rect.pdf",
+    }
+)
+
+_UUID_XLSX_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.xlsx$",
+    re.IGNORECASE,
+)
+
+
+def is_spurious_output_file(filename: str) -> bool:
+    """Return True for known library/scratch artifacts stored in output/."""
+    lower_name = filename.lower()
+    if lower_name in EXCLUDED_REPORT_BASENAMES:
+        return True
+    if _UUID_XLSX_PATTERN.match(lower_name):
+        return True
+    return False
+
+
+def _is_in_outputs_dir(member_path: str) -> bool:
+    normalized_path = member_path.lstrip("./")
+    return (
+        normalized_path.startswith("outputs/")
+        or "/outputs/" in normalized_path
+    )
+
+
+def _is_noise_path(member_path: str) -> bool:
+    lower_path = member_path.lower()
+    return any(fragment in lower_path for fragment in NOISE_PATH_FRAGMENTS)
+
+
+def is_final_deliverable(member_path: str, filename: str) -> bool:
+    """Determine if a file is a final deliverable vs intermediate noise.
+
+    Rules:
+    1. Must live under ./outputs/ (never harvest matplotlib icons, temp PDFs, etc.)
+    2. Must match a known deliverable extension
+    3. Must not come from library/vendor paths inside the sandbox snapshot
+    """
+    if _is_noise_path(member_path):
+        return False
+
+    if not _is_in_outputs_dir(member_path):
+        return False
+
+    lower_filename = filename.lower()
+    return any(lower_filename.endswith(ext) for ext in OUTPUT_DELIVERABLE_EXTENSIONS)
+
+
+def extract_mentioned_deliverables(text: str) -> set[str]:
+    """Find deliverable basenames explicitly referenced in assistant text."""
+    mentioned: set[str] = set()
+    if not text:
+        return mentioned
+
+    for ext in REPORT_EXTENSIONS:
+        if ext == ".tar.gz":
+            pattern = re.compile(
+                r"(?<![\w./-])([\w][\w.-]*\.tar\.gz)(?![\w.-])",
+                re.IGNORECASE,
+            )
+        else:
+            pattern = re.compile(
+                rf"(?<![\w./-])([\w][\w.-]*{re.escape(ext)})(?![\w.-])",
+                re.IGNORECASE,
+            )
+        for match in pattern.finditer(text):
+            mentioned.add(match.group(1))
+
+    return mentioned
+
+
+def filter_reports_by_mentioned_files(
+    reports: list[DownloadResponse],
+    assistant_text: str,
+) -> list[DownloadResponse]:
+    """Keep only harvested files the assistant named in its reply."""
+    mentioned = extract_mentioned_deliverables(assistant_text)
+    if not mentioned:
+        return []
+
+    mentioned_lower = {name.lower() for name in mentioned}
+    return [
+        report
+        for report in reports
+        if report.file_name.lower() in mentioned_lower
+    ]
+
+
 async def harvest_workspace_files(session, gemini_service, gcs_service) -> int:
-    """Copy downloadable files from the Gemini workspace snapshot into GCS output."""
+    """Copy final deliverables from Gemini workspace snapshot to GCS output.
+
+    Filters out intermediate build assets (plot images, temp files, etc.)
+    and only harvests user-facing deliverables. Uses streaming download to
+    temporary file to avoid OOM with large workspaces.
+    """
     if not session.gemini_environment_id:
         return 0
 
-    tar_content = await gemini_service.download_workspace_snapshot(
+    # Use streaming download to temporary file (memory-efficient)
+    tmp = await gemini_service.download_workspace_snapshot_to_tempfile(
         session.gemini_environment_id
     )
 
     harvested_count = 0
-    with tarfile.open(fileobj=io.BytesIO(tar_content), mode="r:*") as tar:
-        for member in tar.getmembers():
-            if not member.isfile():
-                continue
+    try:
+        with tarfile.open(fileobj=tmp, mode="r:*") as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
 
-            filename = os.path.basename(member.name)
-            if not filename or not is_downloadable_report(filename):
-                continue
+                filename = os.path.basename(member.name)
+                if not filename:
+                    continue
 
-            f = tar.extractfile(member)
-            if not f:
-                continue
+                # Filter: only harvest final deliverables, not intermediate noise
+                if not is_final_deliverable(member.name, filename):
+                    continue
 
-            gcs_service.upload_to_path(
-                file_content=f.read(),
-                gcs_path=f"{session.gcs_folder_path}/output/{filename}",
-                content_type=content_type_for_filename(filename),
-            )
-            harvested_count += 1
+                f = tar.extractfile(member)
+                if not f:
+                    continue
+
+                gcs_service.upload_to_path(
+                    file_content=f.read(),
+                    gcs_path=f"{session.gcs_folder_path}/output/{filename}",
+                    content_type=content_type_for_filename(filename),
+                )
+                harvested_count += 1
+    finally:
+        tmp.close()
 
     return harvested_count
+
+
+def report_download_path(session_id: uuid.UUID, filename: str) -> str:
+    """Return app-relative URL for attachment download (no inline preview)."""
+    return f"/chat/{session_id}/reports/{quote(filename)}"
+
+
+def build_download_response(session_id: uuid.UUID, file_info: dict) -> DownloadResponse:
+    """Build download metadata for a harvested output file."""
+    name = file_info["name"]
+    return DownloadResponse(
+        file_name=name,
+        download_url=report_download_path(session_id, name),
+        file_type=os.path.splitext(name)[1],
+        size_bytes=file_info.get("size") or 0,
+    )
+
+
+def _output_report_names(gcs_service, gcs_folder_path: str) -> set[str]:
+    output_path = f"{gcs_folder_path}/output/"
+    return {
+        f["name"]
+        for f in gcs_service.list_files(output_path)
+        if is_downloadable_report(f["name"])
+    }
+
+
+async def list_session_reports(
+    session: UserSession,
+    gemini_service,
+    gcs_service,
+    *,
+    only_new: bool = False,
+) -> tuple[list[DownloadResponse], int]:
+    """Harvest workspace deliverables and return downloadable report metadata."""
+    output_path = f"{session.gcs_folder_path}/output/"
+    existing_names: set[str] = set()
+    if only_new:
+        existing_names = _output_report_names(gcs_service, session.gcs_folder_path)
+
+    harvested_count = 0
+    if session.gemini_environment_id:
+        try:
+            harvested_count = await harvest_workspace_files(
+                session, gemini_service, gcs_service
+            )
+        except Exception as e:
+            logger.warning(f"Unable to harvest workspace reports: {str(e)}")
+
+    reports = []
+    for file_info in gcs_service.list_files(output_path):
+        name = file_info["name"]
+        if not is_downloadable_report(name):
+            continue
+        if is_spurious_output_file(name):
+            continue
+        if only_new and name in existing_names:
+            continue
+        reports.append(build_download_response(session.session_id, file_info))
+
+    return reports, harvested_count
+
+
+def reports_to_dicts(reports: list[DownloadResponse]) -> list[dict]:
+    """Serialize report metadata for SSE JSON payloads."""
+    return [report.model_dump() for report in reports]
+
+
+def build_context_from_history(messages: list[ChatMessage]) -> str:
+    """Build a context string from chat history for environment refresh."""
+    context_parts = []
+    for msg in messages:
+        role_prefix = "User" if msg.role == "user" else "Assistant"
+        context_parts.append(f"[{role_prefix}]: {msg.content[:500]}")
+    return "\n\n".join(context_parts[-5:])  # Keep last 5 messages
 
 
 async def run_agent_prompt(
@@ -163,7 +397,11 @@ async def run_agent_prompt(
     output_text = ""
     interaction_id = None
 
-    if session.gemini_environment_id and session.last_interaction_id:
+    # Check if environment needs refresh due to new file uploads
+    needs_refresh = session.environment_needs_refresh and session.gemini_environment_id
+
+    if session.gemini_environment_id and session.last_interaction_id and not needs_refresh:
+        # Continue existing interaction
         async for event in gemini_service.continue_interaction_streaming(
             prompt=prompt,
             environment_id=session.gemini_environment_id,
@@ -173,10 +411,21 @@ async def run_agent_prompt(
                 output_text = event.message
                 interaction_id = event.data.get("interaction_id")
     else:
+        # Create new interaction
         environment_id = None
 
+        # If refreshing, include chat history as context
+        full_prompt = prompt
+        if needs_refresh and session.gemini_environment_id:
+            history = db.query(ChatMessage).filter(
+                ChatMessage.session_id == session.session_id
+            ).order_by(ChatMessage.created_at.asc()).limit(20).all()
+            if history:
+                context = build_context_from_history(history)
+                full_prompt = f"""Previous conversation context:\n\n{context}\n\n---\n\nNew request: {prompt}"""
+
         async for event in gemini_service.create_interaction_streaming(
-            prompt=prompt,
+            prompt=full_prompt,
             gcs_input_path=gcs_input_path,
             gcs_token=gcs_token,
         ):
@@ -187,6 +436,8 @@ async def run_agent_prompt(
 
         if environment_id:
             session.gemini_environment_id = environment_id
+            session.environment_created_at = datetime.utcnow()
+            session.environment_needs_refresh = False
 
     if interaction_id:
         session.last_interaction_id = interaction_id
@@ -252,12 +503,21 @@ async def send_message(
         db.commit()
         db.refresh(assistant_message)
 
+        reports, _ = await list_session_reports(
+            session=session,
+            gemini_service=gemini_service,
+            gcs_service=gcs_service,
+            only_new=True,
+        )
+        reports = filter_reports_by_mentioned_files(reports, output_text)
+
         return ChatMessageResponse(
             message_id=assistant_message.message_id,
             session_id=assistant_message.session_id,
             role=assistant_message.role,
             content=assistant_message.content,
             created_at=assistant_message.created_at,
+            attachments=reports,
         )
 
     except Exception as e:
@@ -402,34 +662,64 @@ async def send_message_stream(
             output_text = ""
             environment_id = None
             interaction_id = None
+            complete_event_data = {}
 
-            if session.gemini_environment_id and session.last_interaction_id:
+            # Check if environment needs refresh due to new file uploads
+            needs_refresh = session.environment_needs_refresh and session.gemini_environment_id
+
+            if session.gemini_environment_id and session.last_interaction_id and not needs_refresh:
                 # Continue existing interaction
                 async for event in gemini_service.continue_interaction_streaming(
                     prompt=build_data_science_prompt(request.message),
                     environment_id=session.gemini_environment_id,
                     previous_interaction_id=session.last_interaction_id,
                 ):
-                    # Yield SSE event
-                    event_data = json.dumps({
-                        "event_type": event.event_type,
-                        "message": event.message,
-                        "timestamp": event.timestamp.isoformat(),
-                        "data": event.data,
-                    })
-                    yield f"data: {event_data}\n\n"
-
                     if event.event_type == "complete":
                         output_text = event.message
                         environment_id = session.gemini_environment_id
                         interaction_id = event.data.get("interaction_id")
+                        complete_event_data = event.data or {}
+                        continue
+
+                    event_data = json.dumps({
+                        "event_type": event.event_type,
+                        "message": event.message,
+                        "timestamp": event.timestamp.isoformat(),
+                        "data": event.data,
+                    })
+                    yield f"data: {event_data}\n\n"
             else:
-                # Create new interaction
+                # Create new interaction (or refresh due to new files)
+                full_prompt = build_data_science_prompt(request.message)
+
+                # If refreshing, include chat history as context
+                if needs_refresh and session.gemini_environment_id:
+                    history = db.query(ChatMessage).filter(
+                        ChatMessage.session_id == session.session_id
+                    ).order_by(ChatMessage.created_at.asc()).limit(20).all()
+                    if history:
+                        context = build_context_from_history(history)
+                        full_prompt = f"""Previous conversation context:
+
+{context}
+
+---
+
+{full_prompt}"""
+                    yield f'data: {{"event_type": "refresh", "message": "Refreshing environment with new files...", "timestamp": "{datetime.utcnow().isoformat()}"}}\n\n'
+
                 async for event in gemini_service.create_interaction_streaming(
-                    prompt=build_data_science_prompt(request.message),
+                    prompt=full_prompt,
                     gcs_input_path=gcs_input_path,
                     gcs_token=gcs_token,
                 ):
+                    if event.event_type == "complete":
+                        output_text = event.message
+                        environment_id = event.data.get("environment_id")
+                        interaction_id = event.data.get("interaction_id")
+                        complete_event_data = event.data or {}
+                        continue
+
                     event_data = json.dumps({
                         "event_type": event.event_type,
                         "message": event.message,
@@ -438,17 +728,22 @@ async def send_message_stream(
                     })
                     yield f"data: {event_data}\n\n"
 
-                    if event.event_type == "complete":
-                        output_text = event.message
-                        environment_id = event.data.get("environment_id")
-                        interaction_id = event.data.get("interaction_id")
-
             # Update session
-            if environment_id and not session.gemini_environment_id:
+            if environment_id:
                 session.gemini_environment_id = environment_id
+                session.environment_created_at = datetime.utcnow()
+                session.environment_needs_refresh = False
             if interaction_id:
                 session.last_interaction_id = interaction_id
             db.commit()
+
+            reports, harvested_count = await list_session_reports(
+                session=session,
+                gemini_service=gemini_service,
+                gcs_service=gcs_service,
+                only_new=True,
+            )
+            reports = filter_reports_by_mentioned_files(reports, output_text)
 
             # Save assistant message
             assistant_message = ChatMessage(
@@ -460,6 +755,19 @@ async def send_message_stream(
             )
             db.add(assistant_message)
             db.commit()
+
+            complete_payload = {
+                "event_type": "complete",
+                "message": output_text,
+                "timestamp": datetime.utcnow().isoformat(),
+                "data": {
+                    **complete_event_data,
+                    "interaction_id": interaction_id,
+                    "harvested_count": harvested_count,
+                    "reports": reports_to_dicts(reports),
+                },
+            }
+            yield f"data: {json.dumps(complete_payload)}\n\n"
 
         except Exception as e:
             logger.error(f"Error in streaming: {str(e)}")
@@ -550,26 +858,12 @@ async def list_reports(
             detail=f"Session {session_id} not found",
         )
 
-    if session.gemini_environment_id:
-        try:
-            await harvest_workspace_files(session, gemini_service, gcs_service)
-        except Exception as e:
-            logger.warning(f"Unable to refresh Gemini workspace reports: {str(e)}")
-
-    output_path = f"{session.gcs_folder_path}/output/"
-    files = gcs_service.list_files(output_path)
-
-    reports = []
-    for f in files:
-        if is_downloadable_report(f["name"]):
-            reports.append(
-                DownloadResponse(
-                    file_name=f["name"],
-                    download_url=f"/chat/{session_id}/reports/{f['name']}",
-                    file_type=os.path.splitext(f["name"])[1],
-                    size_bytes=f["size"] or 0,
-                )
-            )
+    reports, _ = await list_session_reports(
+        session=session,
+        gemini_service=gemini_service,
+        gcs_service=gcs_service,
+        only_new=False,
+    )
 
     return ReportListResponse(session_id=session_id, reports=reports)
 
@@ -583,11 +877,16 @@ async def list_reports(
 async def download_report(
     session_id: uuid.UUID,
     filename: str,
+    inline: bool = False,
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
-    """Download a specific report from the workspace."""
+    """Download a specific report from the workspace.
+
+    Args:
+        inline: If True, serves file inline (for chat images). If False, forces download.
+    """
     session = db.query(UserSession).filter(
         UserSession.session_id == session_id
     ).first()
@@ -598,6 +897,8 @@ async def download_report(
             detail=f"Session {session_id} not found",
         )
 
+    content = None
+
     # First, try to get from GCS output folder
     output_path = f"{session.gcs_folder_path}/output/{filename}"
     files = gcs_service.list_files(f"{session.gcs_folder_path}/output/")
@@ -605,34 +906,40 @@ async def download_report(
     if any(f["name"] == filename for f in files):
         content = gcs_service.download_file(output_path)
     elif session.gemini_environment_id:
-        # Fall back to downloading workspace snapshot
-        tar_content = await gemini_service.download_workspace_snapshot(
+        # Fall back to streaming workspace snapshot to temp file (memory-efficient)
+        tmp = await gemini_service.download_workspace_snapshot_to_tempfile(
             session.gemini_environment_id
         )
-
-        # Extract the specific file
-        with tarfile.open(fileobj=io.BytesIO(tar_content), mode="r:*") as tar:
-            for member in tar.getmembers():
-                if member.name.endswith(filename):
-                    f = tar.extractfile(member)
-                    if f:
-                        content = f.read()
-                        break
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Report {filename} not found in workspace",
-                )
+        try:
+            with tarfile.open(fileobj=tmp, mode="r:*") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith(filename):
+                        f = tar.extractfile(member)
+                        if f:
+                            content = f.read()
+                            break
+                else:
+                    tmp.close()
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Report {filename} not found in workspace",
+                    )
+        finally:
+            tmp.close()
     else:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Report {filename} not found",
         )
 
+    headers = {}
+    if not inline:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+
     return StreamingResponse(
         io.BytesIO(content),
         media_type=content_type_for_filename(filename),
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=headers,
     )
 
 

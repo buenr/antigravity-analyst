@@ -381,12 +381,38 @@ class GeminiService:
     async def download_workspace_snapshot(
         self, environment_id: str
     ) -> bytes:
-        """Download the workspace snapshot as a tar file."""
+        """Download the workspace snapshot as a tar file (kept for backwards compatibility).
+
+        Note: For large workspaces, use download_workspace_snapshot_to_tempfile() instead
+        to avoid loading the entire archive into memory.
+        """
         async with httpx.AsyncClient(timeout=120.0) as client:
             url = f"{self.BASE_URL}/files/environment-{environment_id}:download?alt=media"
             response = await client.get(url, headers=self.headers, follow_redirects=True)
             _raise_for_status_with_body(response)
             return response.content
+
+    async def download_workspace_snapshot_to_tempfile(
+        self, environment_id: str
+    ) -> "tempfile.TemporaryFile":
+        """Stream download workspace snapshot to a temporary file on disk.
+
+        This is memory-efficient and prevents OOM errors with large workspaces.
+        Returns a TemporaryFile object that must be managed by the caller.
+        """
+        import tempfile
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            url = f"{self.BASE_URL}/files/environment-{environment_id}:download?alt=media"
+            tmp = tempfile.TemporaryFile()
+
+            async with client.stream("GET", url, headers=self.headers, follow_redirects=True) as response:
+                _raise_for_stream_status_with_body(response)
+                async for chunk in response.aiter_bytes():
+                    tmp.write(chunk)
+
+            tmp.seek(0)
+            return tmp
 
 
 # Singleton instance

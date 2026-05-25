@@ -5,6 +5,33 @@
 const API_BASE = '/api';
 
 /**
+ * Parse error response from the server.
+ * Handles both JSON and non-JSON (HTML) error responses.
+ * @param {Response} response - Fetch response object
+ * @returns {Promise<string>} Error message
+ */
+async function parseErrorResponse(response) {
+  const contentType = response.headers.get('content-type') || '';
+  
+  if (contentType.includes('application/json')) {
+    try {
+      const error = await response.json();
+      return error.detail || `Error: ${response.status} ${response.statusText}`;
+    } catch {
+      return `Error: ${response.status} ${response.statusText}`;
+    }
+  }
+  
+  // Non-JSON response (likely HTML error page)
+  const text = await response.text();
+  // Extract meaningful error from HTML or provide generic message
+  if (text.includes('Internal Server Error')) {
+    return `Server error (${response.status}): Please check server logs for details`;
+  }
+  return `Error: ${response.status} ${response.statusText}`;
+}
+
+/**
  * Create a new session.
  * @param {string} tenantId - Optional tenant ID
  * @returns {Promise<Object>} Session data
@@ -17,8 +44,8 @@ export async function createSession(tenantId = 'default') {
   });
   
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to create session');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.json();
@@ -33,7 +60,8 @@ export async function getSession(sessionId) {
   const response = await fetch(`${API_BASE}/sessions/${sessionId}`);
   
   if (!response.ok) {
-    throw new Error('Failed to get session');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.json();
@@ -55,8 +83,8 @@ export async function uploadFile(sessionId, file) {
   });
   
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to upload file');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.json();
@@ -71,7 +99,8 @@ export async function listFiles(sessionId) {
   const response = await fetch(`${API_BASE}/files/${sessionId}`);
   
   if (!response.ok) {
-    throw new Error('Failed to list files');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.json();
@@ -86,7 +115,8 @@ export async function downloadFile(fileId) {
   const response = await fetch(`${API_BASE}/files/download/${fileId}`);
   
   if (!response.ok) {
-    throw new Error('Failed to download file');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.blob();
@@ -106,8 +136,8 @@ export async function sendMessage(sessionId, message) {
   });
   
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to send message');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
   
   return response.json();
@@ -120,11 +150,12 @@ export async function sendMessage(sessionId, message) {
  */
 export async function getChatHistory(sessionId) {
   const response = await fetch(`${API_BASE}/chat/${sessionId}/history`);
-  
+
   if (!response.ok) {
-    throw new Error('Failed to get chat history');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
-  
+
   return response.json();
 }
 
@@ -137,12 +168,12 @@ export async function generateBrief(sessionId) {
   const response = await fetch(`${API_BASE}/chat/${sessionId}/brief`, {
     method: 'POST',
   });
-  
+
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to generate analyst brief');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
-  
+
   return response.json();
 }
 
@@ -153,12 +184,51 @@ export async function generateBrief(sessionId) {
  */
 export async function listReports(sessionId) {
   const response = await fetch(`${API_BASE}/chat/${sessionId}/reports`);
-  
+
   if (!response.ok) {
-    throw new Error('Failed to list reports');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
-  
+
   return response.json();
+}
+
+/**
+ * Extract basename from a sandbox-relative report path.
+ * @param {string} src - Path or filename from agent markdown
+ * @returns {string}
+ */
+export function reportBasename(src) {
+  if (!src) return '';
+  const withoutQuery = src.split('?')[0];
+  return withoutQuery.replace(/^outputs\//, '').split('/').pop();
+}
+
+/**
+ * Build a report download or inline preview URL.
+ * @param {string} sessionId
+ * @param {string} fileName
+ * @param {{ inline?: boolean }} options
+ * @returns {string}
+ */
+export function getReportDownloadUrl(sessionId, fileName, { inline = false } = {}) {
+  const encoded = encodeURIComponent(fileName);
+  return inline
+    ? `${API_BASE}/chat/${sessionId}/reports/${encoded}?inline=1`
+    : `${API_BASE}/chat/${sessionId}/reports/${encoded}`;
+}
+
+/**
+ * Resolve API-relative report paths from the backend.
+ * @param {string} path - e.g. /chat/{id}/reports/file.pdf
+ * @returns {string}
+ */
+export function apiReportPath(path) {
+  if (!path) return path;
+  if (path.startsWith('http') || path.startsWith('/api/')) {
+    return path;
+  }
+  return `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
 /**
@@ -170,10 +240,11 @@ export async function harvestWorkspace(sessionId) {
   const response = await fetch(`${API_BASE}/chat/${sessionId}/harvest`, {
     method: 'POST',
   });
-  
+
   if (!response.ok) {
-    throw new Error('Failed to harvest workspace');
+    const errorMessage = await parseErrorResponse(response);
+    throw new Error(errorMessage);
   }
-  
+
   return response.json();
 }

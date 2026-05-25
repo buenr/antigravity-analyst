@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Download, FileText, FileImage, FileSpreadsheet, RefreshCw } from 'lucide-react';
-import { listReports } from '../services/api';
+import { listReports, apiReportPath } from '../services/api';
 
 /**
  * Component for listing and downloading generated reports.
@@ -52,8 +52,10 @@ export default function FileDownload({ sessionId }) {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const handleDownload = (fileName) => {
-    const url = `/api/chat/${sessionId}/reports/${encodeURIComponent(fileName)}`;
+  const handleDownload = (report) => {
+    const url = report.download_url
+      ? apiReportPath(report.download_url)
+      : `/api/chat/${sessionId}/reports/${encodeURIComponent(report.file_name)}`;
     window.open(url, '_blank');
   };
 
@@ -106,7 +108,7 @@ export default function FileDownload({ sessionId }) {
                 </div>
               </div>
               <button
-                onClick={() => handleDownload(report.file_name)}
+                onClick={() => handleDownload(report)}
                 className="flex items-center gap-1 px-3 py-1.5 bg-primary-50 text-primary-600 rounded-lg hover:bg-primary-100 transition-colors text-sm font-medium"
               >
                 <Download className="w-4 h-4" />

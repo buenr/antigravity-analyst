@@ -9,3 +9,4 @@ google-auth==2.37.0
 python-multipart==0.0.20
 aiofiles==24.1.0
 python-dotenv==1.0.1
+apscheduler==3.11.0

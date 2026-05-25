@@ -98,6 +98,11 @@ async def upload_file(
     )
 
     db.add(uploaded_file)
+
+    # Mark session for environment refresh if already initialized
+    if session.gemini_environment_id:
+        session.environment_needs_refresh = True
+
     db.commit()
     db.refresh(uploaded_file)
 

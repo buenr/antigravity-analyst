@@ -90,7 +90,15 @@ The app will be available at http://localhost:5173
    - "Summarize the data and find outliers"
    - "Create a scatter plot of column A vs column B"
    - "Generate a PDF report with key statistics"
-6. View generated reports in the "Reports" tab
+6. When the agent creates deliverables (PDF, PNG, CSV, etc.), **Download** links appear under that chat reply automatically
+7. Use the **Reports** tab to browse all downloadable files for the session
+
+### Testing downloads in chat
+
+1. Upload a CSV, then ask: `Save a scatter plot as outputs/chart.png` — confirm a Download button appears under the assistant message.
+2. Ask: `Generate a PDF report` — confirm the PDF downloads with an attachment Content-Disposition header.
+3. For PNG deliverables, use **Preview** for inline viewing and **Download** for the file.
+4. On a second request, only new files from that turn should appear under the latest assistant message.
 
 ## API Endpoints
 
@@ -109,7 +117,8 @@ The app will be available at http://localhost:5173
 - `POST /chat/{session_id}/stream` - Send message (SSE streaming)
 - `GET /chat/{session_id}/history` - Get chat history
 - `GET /chat/{session_id}/reports` - List generated reports
-- `GET /chat/{session_id}/reports/{filename}` - Download report
+- `GET /chat/{session_id}/reports/{filename}` - Download report (`?inline=1` for preview)
+- Streaming `complete` events include `data.reports` with per-turn download metadata
 
 ## Project Structure
 
