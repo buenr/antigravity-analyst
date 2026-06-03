@@ -1,12 +1,12 @@
 """Session management router."""
 
 import uuid
-from datetime import datetime
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.auth import generate_session_token, get_owned_session, session_token_dependency
 from app.database import get_db
 from app.models import ChatMessage, UploadedFile, UserSession
 from app.schemas import (
@@ -36,6 +36,7 @@ def create_session(
     # Generate IDs
     session_id = uuid.uuid4()
     user_id = uuid.uuid4()
+    access_token = generate_session_token()
 
     # Create session folder in GCS
     gcs_folder_path = gcs_service.create_session_folder(
@@ -49,6 +50,7 @@ def create_session(
         session_id=session_id,
         user_id=user_id,
         tenant_id=request.tenant_id,
+        access_token=access_token,
         gcs_folder_path=gcs_folder_path,
         status="active",
     )
@@ -60,6 +62,7 @@ def create_session(
     return SessionResponse(
         session_id=session.session_id,
         user_id=session.user_id,
+        session_token=session.access_token,
         tenant_id=session.tenant_id,
         status=session.status,
         created_at=session.created_at,
@@ -75,18 +78,11 @@ def create_session(
 )
 def get_session(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
 ):
     """Get session details."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     return SessionResponse(
         session_id=session.session_id,
@@ -105,10 +101,11 @@ def list_sessions(
     tenant_id: str = None,
     limit: int = 50,
     offset: int = 0,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
 ):
-    """List sessions, optionally filtered by tenant."""
-    query = db.query(UserSession)
+    """List sessions accessible to the supplied session token."""
+    query = db.query(UserSession).filter(UserSession.access_token == session_token)
 
     if tenant_id:
         query = query.filter(UserSession.tenant_id == tenant_id)
@@ -136,19 +133,12 @@ def list_sessions(
 )
 def delete_session(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gcs_service=Depends(get_gcs_service),
 ):
     """Delete a session and all associated files."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     # Delete GCS files
     gcs_service.delete_session_files(

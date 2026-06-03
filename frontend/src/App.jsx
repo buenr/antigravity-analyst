@@ -1,9 +1,83 @@
 import React, { useState, useEffect } from 'react';
-import { Database, Loader2, Trash2, FileUp, MessageSquare, Download } from 'lucide-react';
+import { Database, Loader2, Trash2, FileUp, MessageSquare, Download, Plus, History, ChevronRight, Clock } from 'lucide-react';
 import FileUpload from './components/FileUpload';
 import ChatInterface from './components/ChatInterface';
 import FileDownload from './components/FileDownload';
-import { createSession, getSession, listFiles } from './services/api';
+import {
+  clearSessionCredentials,
+  createSession,
+  deleteSession,
+  getSession,
+  getStoredSessionId,
+  getStoredSessionToken,
+  listFiles,
+  storeSessionCredentials,
+  getSessionHistory,
+  removeFromSessionHistory,
+  setActiveSession,
+  listSessions,
+} from './services/api';
+
+/**
+ * Session history dropdown component.
+ */
+function SessionHistoryDropdown({ sessionHistory, currentSessionId, onSelect, onDelete, loading }) {
+  if (sessionHistory.length === 0) {
+    return (
+      <div className="absolute right-0 mt-2 w-72 bg-white rounded-lg shadow-lg border border-gray-200 py-2 z-50">
+        <div className="px-4 py-3 text-sm text-gray-500 text-center">
+          No previous sessions found
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg border border-gray-200 py-2 z-50 max-h-96 overflow-y-auto">
+      <div className="px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wide border-b border-gray-100">
+        Session History
+      </div>
+      {sessionHistory.map((s) => (
+        <div
+          key={s.session_id}
+          className={`group flex items-center justify-between px-3 py-2 hover:bg-gray-50 ${
+            s.session_id === currentSessionId ? 'bg-primary-50' : ''
+          }`}
+        >
+          <button
+            onClick={() => !loading && onSelect(s)}
+            disabled={loading || s.session_id === currentSessionId}
+            className="flex-1 flex items-center gap-2 text-left disabled:cursor-default"
+          >
+            <div className={`w-2 h-2 rounded-full ${s.session_id === currentSessionId ? 'bg-primary-500' : 'bg-gray-300'}`} />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium text-gray-800 truncate">
+                Session {s.session_id.slice(0, 8)}...
+              </p>
+              <p className="text-xs text-gray-500 flex items-center gap-1">
+                <Clock className="w-3 h-3" />
+                {new Date(s.last_accessed || s.created_at).toLocaleDateString()}
+              </p>
+            </div>
+            {s.session_id === currentSessionId && (
+              <span className="text-xs text-primary-600 font-medium">Active</span>
+            )}
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(s.session_id);
+            }}
+            className="p-1.5 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Delete session"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /**
  * Main application component.
@@ -16,14 +90,32 @@ function App() {
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('upload');
   const [briefRequestId, setBriefRequestId] = useState(0);
+  const [sessionHistory, setSessionHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [switchingSession, setSwitchingSession] = useState(false);
 
   // Load session from localStorage on mount
   useEffect(() => {
-    const savedSessionId = localStorage.getItem('antigravity_session_id');
-    if (savedSessionId) {
+    const savedSessionId = getStoredSessionId();
+    const savedSessionToken = getStoredSessionToken();
+    if (savedSessionId && savedSessionToken) {
       loadSession(savedSessionId);
+    } else {
+      clearSessionCredentials();
     }
+    setSessionHistory(getSessionHistory());
   }, []);
+
+  // Close history dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (showHistory && !event.target.closest('.session-history-container')) {
+        setShowHistory(false);
+      }
+    };
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, [showHistory]);
 
   const loadSession = async (id) => {
     try {
@@ -34,7 +126,7 @@ function App() {
       setFiles(fileData.files || []);
     } catch (err) {
       // Session not found, clear localStorage
-      localStorage.removeItem('antigravity_session_id');
+      clearSessionCredentials();
     }
   };
 
@@ -47,7 +139,8 @@ function App() {
       setSessionId(sessionData.session_id);
       setSession(sessionData);
       setFiles([]);
-      localStorage.setItem('antigravity_session_id', sessionData.session_id);
+      storeSessionCredentials(sessionData);
+      setSessionHistory(getSessionHistory());
     } catch (err) {
       setError(err.message);
     } finally {
@@ -55,11 +148,52 @@ function App() {
     }
   };
 
-  const handleDeleteSession = () => {
+  const handleDeleteSession = async (id) => {
+    if (!id) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      await deleteSession(id);
+      if (sessionId === id) {
+        setSessionId(null);
+        setSession(null);
+        setFiles([]);
+        clearSessionCredentials();
+      }
+      removeFromSessionHistory(id);
+      setSessionHistory(getSessionHistory());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSwitchSession = async (historySession) => {
+    setSwitchingSession(true);
+    setError(null);
+
+    try {
+      // Set the session as active in localStorage
+      setActiveSession(historySession);
+      // Reload the session data from the server
+      await loadSession(historySession.session_id);
+      setSessionHistory(getSessionHistory());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSwitchingSession(false);
+    }
+  };
+
+  const handleNewSession = () => {
     setSessionId(null);
     setSession(null);
     setFiles([]);
-    localStorage.removeItem('antigravity_session_id');
+    clearSessionCredentials();
+    setShowHistory(false);
   };
 
   const handleUploadComplete = (file) => {
@@ -91,6 +225,38 @@ function App() {
 
             {session && (
               <div className="flex items-center gap-3">
+                <button
+                  onClick={handleNewSession}
+                  className="flex items-center gap-1 px-3 py-1.5 text-sm text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
+                  title="Start a new session"
+                >
+                  <Plus className="w-4 h-4" />
+                  New Session
+                </button>
+                <div className="relative session-history-container">
+                  <button
+                    onClick={() => setShowHistory(!showHistory)}
+                    className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                    title="View session history"
+                  >
+                    <History className="w-4 h-4" />
+                    History
+                    {sessionHistory.length > 0 && (
+                      <span className="ml-1 px-1.5 py-0.5 text-xs bg-gray-200 text-gray-700 rounded-full">
+                        {sessionHistory.length}
+                      </span>
+                    )}
+                  </button>
+                  {showHistory && (
+                    <SessionHistoryDropdown
+                      sessionHistory={sessionHistory}
+                      currentSessionId={sessionId}
+                      onSelect={handleSwitchSession}
+                      onDelete={handleDeleteSession}
+                      loading={switchingSession}
+                    />
+                  )}
+                </div>
                 <div className="text-right text-sm">
                   <p className="text-gray-500">Session</p>
                   <p className="font-mono text-xs text-gray-400">
@@ -98,7 +264,7 @@ function App() {
                   </p>
                 </div>
                 <button
-                  onClick={handleDeleteSession}
+                  onClick={() => handleDeleteSession(sessionId)}
                   className="p-2 text-gray-400 hover:text-red-500 transition-colors"
                   title="Delete session"
                 >
@@ -113,7 +279,7 @@ function App() {
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
         {!session ? (
-          /* No Session - Show Create Button */
+          /* No Session - Show Create Button and History */
           <div className="flex flex-col items-center justify-center py-16">
             <Database className="w-24 h-24 text-gray-300 mb-6" />
             <h2 className="text-2xl font-bold text-gray-800 mb-2">
@@ -142,11 +308,53 @@ function App() {
                 </>
               ) : (
                 <>
-                  <Database className="w-5 h-5" />
+                  <Plus className="w-5 h-5" />
                   Create New Session
                 </>
               )}
             </button>
+
+            {sessionHistory.length > 0 && (
+              <div className="mt-8 w-full max-w-lg">
+                <h3 className="text-sm font-medium text-gray-500 mb-3 text-center">
+                  Previous Sessions
+                </h3>
+                <div className="bg-white rounded-lg border border-gray-200 divide-y divide-gray-100">
+                  {sessionHistory.slice(0, 5).map((s) => (
+                    <div
+                      key={s.session_id}
+                      className="group flex items-center justify-between p-3 hover:bg-gray-50"
+                    >
+                      <button
+                        onClick={() => handleSwitchSession(s)}
+                        disabled={loading}
+                        className="flex-1 flex items-center gap-3 text-left"
+                      >
+                        <div className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center">
+                          <Database className="w-4 h-4 text-gray-500" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium text-gray-800">
+                            Session {s.session_id.slice(0, 8)}...
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {new Date(s.last_accessed || s.created_at).toLocaleDateString()} at{' '}
+                            {new Date(s.last_accessed || s.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        </div>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteSession(s.session_id)}
+                        className="p-2 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Delete session"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           /* Active Session - Show Tabs and Content */

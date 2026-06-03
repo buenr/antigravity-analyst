@@ -1,0 +1,4 @@
+# Tier 3 — forecasting (install for time-series, trend, or forecast tasks)
+pmdarima
+prophet
+sktime

@@ -22,6 +22,13 @@ class Settings(BaseSettings):
 
     # Gemini API
     gemini_api_key: str
+    gemini_agent_name: str = "antigravity-preview-05-2026"
+    gemini_system_instruction: str = (
+        "You are a specialized data scientist and analyst. Use mounted "
+        "AGENTS.md instructions and skills, inspect real uploaded data before "
+        "answering, and save final user-facing deliverables in ./outputs/."
+    )
+    agent_config_dir: str = ".agents"
 
     # File Upload
     max_file_size_mb: int = 50

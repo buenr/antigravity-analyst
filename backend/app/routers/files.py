@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.auth import get_owned_session, session_token_dependency
 from app.config import get_settings
 from app.database import get_db
 from app.models import UploadedFile, UserSession
@@ -43,20 +44,12 @@ def validate_file_extension(filename: str) -> bool:
 async def upload_file(
     session_id: uuid.UUID,
     file: UploadFile = File(...),
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gcs_service=Depends(get_gcs_service),
 ):
     """Upload a CSV or Excel file to a session."""
-    # Check session exists
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     # Validate file extension
     if not validate_file_extension(file.filename):
@@ -124,18 +117,11 @@ async def upload_file(
 )
 def list_files(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
 ):
     """List all files uploaded to a session."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    get_owned_session(db, session_id, session_token)
 
     files = db.query(UploadedFile).filter(
         UploadedFile.session_id == session_id
@@ -163,6 +149,7 @@ def list_files(
 )
 async def download_file(
     file_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gcs_service=Depends(get_gcs_service),
 ):
@@ -176,6 +163,8 @@ async def download_file(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"File {file_id} not found",
         )
+
+    get_owned_session(db, uploaded_file.session_id, session_token)
 
     # Download from GCS
     content = gcs_service.download_file(uploaded_file.gcs_path)
@@ -199,6 +188,7 @@ async def download_file(
 )
 def delete_file(
     file_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gcs_service=Depends(get_gcs_service),
 ):
@@ -212,6 +202,8 @@ def delete_file(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"File {file_id} not found",
         )
+
+    get_owned_session(db, uploaded_file.session_id, session_token)
 
     # Delete from GCS
     gcs_service.delete_file(uploaded_file.gcs_path)

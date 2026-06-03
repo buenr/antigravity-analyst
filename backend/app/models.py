@@ -23,6 +23,7 @@ class UserSession(Base):
     )
     user_id = Column(GUID(), nullable=False, default=uuid.uuid4)
     tenant_id = Column(String(100), nullable=False, default="default")
+    access_token = Column(String(255), nullable=True, index=True)
     gemini_environment_id = Column(String(255), nullable=True)
     last_interaction_id = Column(String(255), nullable=True)
     gcs_folder_path = Column(String(512), nullable=False)

@@ -5,8 +5,6 @@ import {
   Loader2,
   User,
   Bot,
-  Terminal,
-  CheckCircle,
   AlertCircle,
   X,
   Download,
@@ -14,15 +12,22 @@ import {
   FileImage,
   FileSpreadsheet,
   ExternalLink,
+  Paperclip,
 } from 'lucide-react';
 import { useStreamingChat } from '../hooks/useSSE';
 import {
+  fileToImageInput,
   generateBrief,
   getChatHistory,
   getReportDownloadUrl,
   reportBasename,
   apiReportPath,
 } from '../services/api';
+import AgentActivity from './AgentActivity';
+import UsageBadge from './UsageBadge';
+
+const MAX_INLINE_IMAGES = 4;
+const MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg']);
 
@@ -128,15 +133,16 @@ function MessageAttachments({ sessionId, attachments }) {
 export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [streamingOutput, setStreamingOutput] = useState('');
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [briefLoading, setBriefLoading] = useState(false);
   const [briefError, setBriefError] = useState(null);
+  const [pendingImages, setPendingImages] = useState([]);
+  const [imageError, setImageError] = useState(null);
   const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
   const handledBriefRequestRef = useRef(0);
 
   const { isStreaming, events, startStream, stopStream, error } = useStreamingChat();
-  const [terminalExpanded, setTerminalExpanded] = useState(false);
 
   const markdownComponents = useMemo(
     () => ({
@@ -187,6 +193,7 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
               role: message.role,
               content: message.content,
               attachments: message.attachments || [],
+              usage: message.usage || null,
             }))
           );
         }
@@ -236,6 +243,7 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
               role: brief.role,
               content: brief.content,
               attachments: brief.attachments || [],
+              usage: brief.usage || null,
             },
           ]);
         }
@@ -260,69 +268,86 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, streamingOutput, events, briefLoading]);
+  }, [messages, events, briefLoading]);
 
-  // Process streaming events
+  // Process streaming events - only handle errors here, completion is rendered inline
   useEffect(() => {
-    if (events.length > 0) {
-      const latestEvent = events[events.length - 1];
+    if (events.length === 0) return;
+    const latestEvent = events[events.length - 1];
 
-      if (latestEvent.event_type === 'terminal') {
-        setStreamingOutput((prev) => prev + latestEvent.message + '\n');
-      } else if (latestEvent.event_type === 'complete') {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now(),
-            role: 'assistant',
-            content: latestEvent.message,
-            attachments: latestEvent.data?.reports || [],
-          },
-        ]);
-        setStreamingOutput('');
-        setTerminalExpanded(false);
-      } else if (latestEvent.event_type === 'error') {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now(),
-            role: 'error',
-            content: latestEvent.message,
-          },
-        ]);
-        setStreamingOutput('');
-      }
+    if (latestEvent.event_type === 'error') {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now(),
+          role: 'error',
+          content: latestEvent.message,
+        },
+      ]);
     }
   }, [events]);
+
+  const handleImagePick = async (fileList) => {
+    setImageError(null);
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+
+    const remaining = MAX_INLINE_IMAGES - pendingImages.length;
+    if (remaining <= 0) {
+      setImageError(`You can attach at most ${MAX_INLINE_IMAGES} images per message.`);
+      return;
+    }
+    const accepted = files.slice(0, remaining);
+
+    const next = [];
+    for (const file of accepted) {
+      if (!file.type.startsWith('image/')) {
+        setImageError(`${file.name} is not an image.`);
+        continue;
+      }
+      if (file.size > MAX_INLINE_IMAGE_BYTES) {
+        setImageError(`${file.name} exceeds 5 MB.`);
+        continue;
+      }
+      try {
+        const img = await fileToImageInput(file);
+        next.push({ ...img, _name: file.name, _previewUrl: URL.createObjectURL(file) });
+      } catch (err) {
+        setImageError(err.message || 'Failed to read image');
+      }
+    }
+    if (next.length > 0) {
+      setPendingImages((prev) => [...prev, ...next]);
+    }
+  };
+
+  const removePendingImage = (index) => {
+    setPendingImages((prev) => {
+      const next = [...prev];
+      const [removed] = next.splice(index, 1);
+      if (removed?._previewUrl) URL.revokeObjectURL(removed._previewUrl);
+      return next;
+    });
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    if (!input.trim() || isStreaming || briefLoading) return;
+    if ((!input.trim() && pendingImages.length === 0) || isStreaming || briefLoading) return;
 
+    const imagesPayload = pendingImages.map(({ data, mime_type }) => ({ data, mime_type }));
     const userMessage = {
       id: Date.now(),
       role: 'user',
       content: input,
+      images: pendingImages.map(({ _previewUrl, _name }) => ({ _previewUrl, _name })),
     };
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
+    setPendingImages([]);
+    setImageError(null);
 
-    await startStream(sessionId, input);
-  };
-
-  const renderEventIcon = (eventType) => {
-    switch (eventType) {
-      case 'terminal':
-      case 'code_execution':
-        return <Terminal className="w-4 h-4 text-yellow-500" />;
-      case 'complete':
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
-      case 'error':
-        return <AlertCircle className="w-4 h-4 text-red-500" />;
-      default:
-        return <Bot className="w-4 h-4 text-primary-500" />;
-    }
+    await startStream(sessionId, userMessage.content, imagesPayload);
   };
 
   return (
@@ -388,7 +413,23 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
               }`}
             >
               {msg.role === 'user' ? (
-                <p className="whitespace-pre-wrap">{msg.content}</p>
+                <>
+                  {msg.images?.length > 0 && (
+                    <div className="flex flex-wrap gap-2 mb-2">
+                      {msg.images.map((img, idx) => (
+                        <img
+                          key={idx}
+                          src={img._previewUrl}
+                          alt={img._name || 'attachment'}
+                          className="w-20 h-20 object-cover rounded-md border border-primary-400"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {msg.content && (
+                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                  )}
+                </>
               ) : (
                 <>
                   <div className="markdown-content prose prose-sm max-w-none">
@@ -397,10 +438,13 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
                     </ReactMarkdown>
                   </div>
                   {msg.role === 'assistant' && (
-                    <MessageAttachments
-                      sessionId={sessionId}
-                      attachments={msg.attachments}
-                    />
+                    <>
+                      <MessageAttachments
+                        sessionId={sessionId}
+                        attachments={msg.attachments}
+                      />
+                      <UsageBadge usage={msg.usage} />
+                    </>
                   )}
                 </>
               )}
@@ -413,53 +457,96 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
           </div>
         ))}
 
-        {(isStreaming || streamingOutput) && (
-          <div className="flex gap-3">
-            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center">
-              <Loader2 className="w-5 h-5 text-primary-600 animate-spin" />
-            </div>
-            <div className="flex-1">
-              <details
-                className="bg-gray-900 text-gray-100 rounded-lg font-mono text-sm overflow-x-auto"
-                open={terminalExpanded}
-              >
-                <summary
-                  className="flex items-center gap-2 p-3 cursor-pointer list-none select-none text-primary-400 hover:text-primary-300"
-                  onClick={() => setTerminalExpanded(!terminalExpanded)}
-                >
-                  <Terminal className="w-4 h-4 flex-shrink-0" />
-                  <span>Agent executing... (click to expand)</span>
-                </summary>
-                <div className="px-4 pb-4">
-                  <pre className="whitespace-pre-wrap text-green-400">
-                    {streamingOutput || 'Initializing sandbox...'}
-                  </pre>
-                </div>
-              </details>
-            </div>
-          </div>
-        )}
-
-        {isStreaming && events.length > 0 && (
-          <div className="space-y-1">
-            {events.slice(-5).map((event, idx) => (
-              <div
-                key={idx}
-                className="flex items-center gap-2 text-sm text-gray-500"
-              >
-                {renderEventIcon(event.event_type)}
-                <span>{event.event_type}:</span>
-                <span className="truncate">{event.message?.slice(0, 100)}</span>
+        {(isStreaming || events.length > 0) && (
+          <>
+            <div className="flex gap-3">
+              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center">
+                <Bot className="w-5 h-5 text-primary-600" />
               </div>
-            ))}
-          </div>
+              <div className="flex-1 min-w-0">
+                <AgentActivity events={events} isStreaming={isStreaming} />
+              </div>
+            </div>
+            {events.some(
+              (ev) => ev.event_type === 'complete' && ev.message
+            ) && (
+              <div className="flex gap-3">
+                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center">
+                  <Bot className="w-5 h-5 text-primary-600" />
+                </div>
+                <div className="max-w-[80%] rounded-lg p-4 bg-white border border-gray-200">
+                  <div className="markdown-content prose prose-sm max-w-none">
+                    <ReactMarkdown components={markdownComponents}>
+                      {events.find((ev) => ev.event_type === 'complete')?.message || ''}
+                    </ReactMarkdown>
+                  </div>
+                  {events.find((ev) => ev.event_type === 'complete')?.data?.reports && (
+                    <MessageAttachments
+                      sessionId={sessionId}
+                      attachments={events.find((ev) => ev.event_type === 'complete').data.reports}
+                    />
+                  )}
+                  {events.find((ev) => ev.event_type === 'complete')?.data?.usage && (
+                    <UsageBadge usage={events.find((ev) => ev.event_type === 'complete').data.usage} />
+                  )}
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         <div ref={messagesEndRef} />
       </div>
 
       <div className="border-t border-gray-200 p-4 bg-white">
-        <form onSubmit={handleSubmit} className="flex gap-3">
+        {pendingImages.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {pendingImages.map((img, idx) => (
+              <div
+                key={idx}
+                className="relative group w-16 h-16 rounded-md overflow-hidden border border-gray-300"
+              >
+                <img
+                  src={img._previewUrl}
+                  alt={img._name}
+                  className="w-full h-full object-cover"
+                />
+                <button
+                  type="button"
+                  onClick={() => removePendingImage(idx)}
+                  className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                  aria-label={`Remove ${img._name}`}
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {imageError && (
+          <div className="mb-2 text-xs text-red-600">{imageError}</div>
+        )}
+        <form onSubmit={handleSubmit} className="flex gap-2 items-center">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              handleImagePick(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isStreaming || briefLoading || !hasFiles}
+            className="p-2 text-gray-500 hover:text-primary-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Attach image"
+          >
+            <Paperclip className="w-5 h-5" />
+          </button>
           <input
             type="text"
             value={input}
@@ -484,7 +571,11 @@ export default function ChatInterface({ sessionId, hasFiles, briefRequestId = 0 
           ) : (
             <button
               type="submit"
-              disabled={briefLoading || !input.trim() || !hasFiles}
+              disabled={
+                briefLoading ||
+                !hasFiles ||
+                (!input.trim() && pendingImages.length === 0)
+              }
               className="px-6 py-2 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               <Send className="w-5 h-5" />

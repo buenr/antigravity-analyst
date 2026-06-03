@@ -83,7 +83,7 @@ The app will be available at http://localhost:5173
 ## Usage
 
 1. Open http://localhost:5173
-2. Click "Create New Session"
+2. Click "Create New Session" (the browser stores a session access token locally)
 3. Upload CSV or Excel files (max 50MB)
 4. Switch to "Chat" tab
 5. Ask questions about your data, e.g.:
@@ -120,6 +120,9 @@ The app will be available at http://localhost:5173
 - `GET /chat/{session_id}/reports/{filename}` - Download report (`?inline=1` for preview)
 - Streaming `complete` events include `data.reports` with per-turn download metadata
 
+Session-specific endpoints require the `X-Session-Token` header returned by `POST /sessions/`.
+Report download URLs may also pass the token as `session_token` for browser previews/download links.
+
 ## Project Structure
 
 ```
@@ -154,8 +157,10 @@ antigravity-agent/
 ## Notes
 
 - Sessions and files are stored in isolated GCS paths: `gs://{bucket}/tenants/{tenant}/users/{user}/sessions/{session}/`
+- Session access is protected by an unguessable per-session token stored in browser local storage.
+- Deleting a session from the UI calls the backend delete endpoint and removes the session database rows and GCS files.
 - The Gemini sandbox has 4 CPU cores and 16GB RAM
-- Environments expire after 15 minutes of inactivity
+- Environments idle after 15 minutes of inactivity and can remain resumable for up to 7 days
 - Maximum file upload size: 50MB
 
 ## License

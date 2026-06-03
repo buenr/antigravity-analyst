@@ -1,0 +1,9 @@
+# Tier 1 — core analysis stack (install on every fresh environment)
+scipy
+statsmodels
+scikit-learn
+matplotlib
+seaborn
+plotly
+kaleido
+openpyxl

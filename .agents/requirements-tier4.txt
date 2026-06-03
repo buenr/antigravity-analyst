@@ -1,0 +1,7 @@
+# Tier 4 — deliverable generation (install when building reports, slides, or HTML exports)
+jinja2
+markdown
+fpdf2
+python-pptx
+python-docx
+altair

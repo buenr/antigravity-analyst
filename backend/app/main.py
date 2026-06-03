@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -34,11 +35,7 @@ async def cleanup_expired_sessions():
     gcs_service = None
 
     try:
-        # Find expired sessions using dialect-agnostic SQL
-        # Use SQLAlchemy's func for cross-database compatibility
-        from sqlalchemy import func
-        from datetime import timedelta
-
+        # Find expired sessions using dialect-agnostic datetime comparison.
         timeout_delta = timedelta(minutes=settings.session_timeout_minutes)
         cutoff_time = datetime.utcnow() - timeout_delta
 

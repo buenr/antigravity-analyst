@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { getStoredSessionToken } from '../services/api';
 
 /**
  * Custom hook for Server-Sent Events (SSE) streaming.
@@ -91,7 +92,7 @@ export function useStreamingChat() {
   const [error, setError] = useState(null);
   const abortControllerRef = useRef(null);
 
-  const startStream = useCallback(async (sessionId, message) => {
+  const startStream = useCallback(async (sessionId, message, images = []) => {
     // Abort any existing stream
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -107,8 +108,13 @@ export function useStreamingChat() {
     try {
       const response = await fetch(`/api/chat/${sessionId}/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, stream: true }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(getStoredSessionToken()
+            ? { 'X-Session-Token': getStoredSessionToken() }
+            : {}),
+        },
+        body: JSON.stringify({ message, stream: true, images }),
         signal: abortController.signal,
       });
 

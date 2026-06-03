@@ -1,5 +1,6 @@
 """Chat and analysis router with SSE streaming."""
 
+import base64
 import io
 import json
 import logging
@@ -8,23 +9,28 @@ import re
 import tarfile
 import uuid
 from datetime import datetime
+from typing import AsyncGenerator
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.auth import get_owned_session, session_token_dependency
+from app.database import get_db, SessionLocal
 from app.models import ChatMessage, UploadedFile, UserSession
 from app.schemas import (
     ChatMessageResponse,
     ChatRequest,
     ErrorResponse,
     DownloadResponse,
+    ImageInput,
+    ProgressEvent,
     ReportListResponse,
+    UsageInfo,
 )
 from app.services.gcs_service import get_gcs_service
-from app.services.gemini_service import get_gemini_service
+from app.services.gemini_service import GeminiApiError, get_gemini_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -53,6 +59,8 @@ REPORT_EXTENSIONS = (
 
 ANALYST_BRIEF_PROMPT = """You are a careful data analyst. Inspect the uploaded files mounted at /workspace/data and write a concise first-pass analyst brief.
 
+Before inspecting data: ensure Tier 1 packages are installed by running `bash .agents/bootstrap_packages.sh 1` if needed (see `.agents/AGENTS.md`). Do not mention bootstrap in the brief unless installation failed.
+
 Include:
 - Dataset names, row counts, column counts, and important columns when you can determine them.
 - Likely meanings of the columns, but label guesses as guesses.
@@ -65,15 +73,16 @@ Do not invent conclusions beyond what you can inspect. If a file cannot be read,
 DATA_SCIENCE_PROMPT_TEMPLATE = """You are a rigorous data scientist working in a Python sandbox with the uploaded files in /workspace/data.
 
 Before answering:
-1. Inspect the actual files, schemas, row counts, column types, missing values, and sample rows.
-2. State assumptions clearly and do not invent conclusions.
-3. For ML tasks, identify the target column, check for leakage, choose an appropriate train/test split, build a simple baseline first, then compare better models only if useful.
-4. Report metrics appropriate to the task: classification, regression, clustering, or forecasting.
-5. Save final requested deliverables inside a directory named `./outputs/` (relative to your current working directory).
+1. Ensure required Python packages are installed per `.agents/AGENTS.md` (Tier 1 always; higher tiers on demand via `bash .agents/bootstrap_packages.sh <tier>`).
+2. Inspect the actual files, schemas, row counts, column types, missing values, and sample rows.
+3. State assumptions clearly and do not invent conclusions.
+4. For ML tasks, identify the target column, check for leakage, choose an appropriate train/test split, build a simple baseline first, then compare better models only if useful.
+5. Report metrics appropriate to the task: classification, regression, clustering, or forecasting.
+6. Save final requested deliverables inside a directory named `./outputs/` (relative to your current working directory).
    - Create the `./outputs/` directory first if it does not exist.
    - Always place the final user-facing files (e.g., a compiled PDF report, a PowerPoint presentation, or a final clean summary CSV) in `./outputs/`.
    - Leave all raw plotting images, temporary cleanups, and scratchpad files in the root directory or `./tmp/`. Do not put intermediate building blocks in `./outputs/`.
-6. When the user asks for a downloadable artifact (PDF, chart image, export, etc.):
+7. When the user asks for a downloadable artifact (PDF, chart image, export, etc.):
    - Save it under `./outputs/` with a clear basename (e.g. `revenue_chart.png`, `analysis_report.pdf`).
    - In your final answer, name each deliverable file exactly as saved (basename only).
    - Do not invent URLs, session IDs, or download links; the application attaches download links automatically.
@@ -379,14 +388,183 @@ def build_context_from_history(messages: list[ChatMessage]) -> str:
     return "\n\n".join(context_parts[-5:])  # Keep last 5 messages
 
 
-async def run_agent_prompt(
+def _usage_from_event_data(data: dict | None) -> UsageInfo | None:
+    """Pull a usage payload out of an interaction.completed event."""
+    if not data:
+        return None
+    usage = data.get("usage")
+    if not usage and isinstance(data.get("interaction"), dict):
+        usage = data["interaction"].get("usage")
+    if not isinstance(usage, dict):
+        return None
+    try:
+        return UsageInfo(**{k: v for k, v in usage.items() if k in UsageInfo.model_fields})
+    except Exception:
+        logger.debug("Could not coerce usage payload: %s", usage)
+        return None
+
+
+_EXPIRED_INTERACTION_MARKERS = (
+    "not found",
+    "interaction",
+    "expired",
+    "previous_interaction",
+    "invalid_argument",
+)
+
+
+def _is_expired_interaction_error(exc: BaseException) -> bool:
+    """Heuristic: does this Gemini error mean ``previous_interaction_id`` is no longer valid?
+
+    The Interactions API retains interactions 1 day (free tier) / 55 days (paid).
+    Once retention expires the API returns 404 NOT_FOUND or 400 INVALID_ARGUMENT
+    referencing the missing interaction; on those we silently restart the conversation.
+    """
+    if not isinstance(exc, GeminiApiError):
+        return False
+    if exc.status_code not in (400, 404):
+        return False
+    body = (exc.body or "").lower()
+    return any(marker in body for marker in _EXPIRED_INTERACTION_MARKERS)
+
+
+# Text-decodable extensions that we will inline into the prompt for the agent
+# to write into /workspace/data when reusing an existing sandbox.
+_TEXT_INLINE_EXTENSIONS = frozenset(
+    {".csv", ".tsv", ".json", ".jsonl", ".txt", ".md", ".log", ".yaml", ".yml"}
+)
+_IMAGE_INLINE_MIME_PREFIX = "image/"
+_INLINE_TEXT_MAX_BYTES = 500_000      # ~500 KB per text file
+_INLINE_IMAGE_MAX_BYTES = 4_000_000   # ~4 MB raw image (≈5.5 MB base64)
+
+
+def _files_uploaded_since_environment(
+    db: Session, session: UserSession
+) -> list[UploadedFile]:
+    """Return uploads created after the current sandbox was provisioned."""
+    if not session.gemini_environment_id or not session.environment_created_at:
+        return []
+    return (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.session_id == session.session_id,
+            UploadedFile.created_at > session.environment_created_at,
+        )
+        .order_by(UploadedFile.created_at.asc())
+        .all()
+    )
+
+
+def _prepare_inline_new_files(
+    new_files: list[UploadedFile],
+    gcs_service,
+) -> tuple[list[str], list[dict], list[str]]:
+    """Try to inline each new upload so the existing sandbox can pick it up
+    without losing installed packages.
+
+    Returns ``(text_blocks, image_inputs, oversized)`` where:
+      * ``text_blocks`` is a list of fenced code blocks to splice into the prompt,
+        each prefixed with an instruction to ``Save the contents below to
+        /workspace/data/<filename>``.
+      * ``image_inputs`` is a list of multimodal image parts (base64).
+      * ``oversized`` lists files that couldn't be inlined and therefore require
+        the caller to fall back to recreating the sandbox.
+    """
+    text_blocks: list[str] = []
+    image_inputs: list[dict] = []
+    oversized: list[str] = []
+
+    for uf in new_files:
+        try:
+            content = gcs_service.download_file(uf.gcs_path)
+        except Exception as e:
+            logger.warning("Could not read %s from GCS: %s", uf.original_filename, e)
+            oversized.append(uf.original_filename)
+            continue
+
+        mime = (uf.mime_type or "").lower()
+        ext = os.path.splitext(uf.original_filename)[1].lower()
+
+        if mime.startswith(_IMAGE_INLINE_MIME_PREFIX):
+            if len(content) > _INLINE_IMAGE_MAX_BYTES:
+                oversized.append(uf.original_filename)
+                continue
+            image_inputs.append({
+                "data": base64.b64encode(content).decode("ascii"),
+                "mime_type": mime or "image/png",
+            })
+            continue
+
+        if ext in _TEXT_INLINE_EXTENSIONS and len(content) <= _INLINE_TEXT_MAX_BYTES:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = content.decode("utf-8", errors="replace")
+                except Exception:
+                    oversized.append(uf.original_filename)
+                    continue
+            safe_name = uf.original_filename.replace("`", "\\`")
+            text_blocks.append(
+                f"### New uploaded file `{safe_name}`\n"
+                f"Save the verbatim contents below to `/workspace/data/{safe_name}` "
+                f"using Python (e.g. `Path(...).write_text(...)` or `write_bytes`) "
+                f"before processing.\n\n"
+                f"```\n{text}\n```"
+            )
+            continue
+
+        oversized.append(uf.original_filename)
+
+    return text_blocks, image_inputs, oversized
+
+
+def _augment_prompt_with_new_files(prompt: str, text_blocks: list[str]) -> str:
+    """Splice inline file blocks into the prompt as a NEW FILES preamble."""
+    if not text_blocks:
+        return prompt
+    preamble = (
+        "[SYSTEM] The user uploaded new files since the sandbox was last refreshed. "
+        "Save each one into /workspace/data/ exactly as named before answering, "
+        "then continue with the user's request below.\n\n"
+        + "\n\n".join(text_blocks)
+        + "\n\n---\n\n"
+    )
+    return preamble + prompt
+
+
+async def drive_agent_interaction(
     prompt: str,
     session: UserSession,
     db: Session,
     gemini_service,
     gcs_service,
-) -> tuple[str, str | None]:
-    """Run a prompt against the session's Gemini environment and update session state."""
+    images: list[dict] | None = None,
+) -> AsyncGenerator[ProgressEvent, None]:
+    """Single source of truth for routing a prompt to Gemini.
+
+    Yields raw ProgressEvent objects from the underlying SSE stream and handles
+    three concerns transparently:
+
+      1. **Continue when possible.** If the session has an active env + interaction
+         and no new uploads pending, continue the existing interaction.
+      2. **Expired interaction retry.** A 400/404 from the continue path is treated
+         as an expired ``previous_interaction_id`` (Gemini retains interactions for
+         1 day / 55 days). The conversation restarts on a fresh interaction with
+         prior chat history as context, transparently to the caller.
+      3. **Soft refresh on new uploads.** When new files were uploaded since the
+         sandbox was provisioned, inline them into the prompt (text files) or as
+         multimodal images so the existing sandbox can pick them up without
+         discarding installed packages. Only if a new file is too large or binary
+         to inline do we recreate the sandbox.
+
+    Session state (``gemini_environment_id``, ``last_interaction_id``,
+    ``environment_needs_refresh``, ``environment_created_at``) is updated on
+    completion.
+    """
+    # Re-attach session to database session in case it became detached
+    session = db.merge(session)
+
     gcs_input_path = gcs_service.get_input_folder_path(
         tenant_id=session.tenant_id,
         user_id=str(session.user_id),
@@ -394,56 +572,155 @@ async def run_agent_prompt(
     )
     gcs_token = gcs_service.get_access_token()
 
+    needs_refresh = bool(
+        session.environment_needs_refresh and session.gemini_environment_id
+    )
+
+    # Try a soft refresh first (preserve sandbox + installed tiers) when possible.
+    inline_text_blocks: list[str] = []
+    inline_image_inputs: list[dict] = []
+    force_recreate = False
+    if needs_refresh:
+        new_files = _files_uploaded_since_environment(db, session)
+        if new_files:
+            inline_text_blocks, inline_image_inputs, oversized = (
+                _prepare_inline_new_files(new_files, gcs_service)
+            )
+            if oversized:
+                force_recreate = True
+                logger.info(
+                    "Recreating sandbox because new uploads are not inline-safe: %s",
+                    oversized,
+                )
+
+    can_continue = (
+        session.gemini_environment_id
+        and session.last_interaction_id
+        and (not needs_refresh or not force_recreate)
+    )
+
+    combined_images = list(images or []) + inline_image_inputs
+
     output_text = ""
-    interaction_id = None
+    interaction_id: str | None = None
+    new_environment_id: str | None = None
+    usage: UsageInfo | None = None
 
-    # Check if environment needs refresh due to new file uploads
-    needs_refresh = session.environment_needs_refresh and session.gemini_environment_id
-
-    if session.gemini_environment_id and session.last_interaction_id and not needs_refresh:
-        # Continue existing interaction
+    async def _run_continue() -> AsyncGenerator[ProgressEvent, None]:
+        nonlocal output_text, interaction_id, usage
+        continue_prompt = _augment_prompt_with_new_files(prompt, inline_text_blocks)
         async for event in gemini_service.continue_interaction_streaming(
-            prompt=prompt,
+            prompt=continue_prompt,
             environment_id=session.gemini_environment_id,
             previous_interaction_id=session.last_interaction_id,
+            images=combined_images,
         ):
             if event.event_type == "complete":
                 output_text = event.message
                 interaction_id = event.data.get("interaction_id")
-    else:
-        # Create new interaction
-        environment_id = None
+                usage = _usage_from_event_data(event.data)
+            yield event
 
-        # If refreshing, include chat history as context
+    async def _run_create(with_history: bool) -> AsyncGenerator[ProgressEvent, None]:
+        nonlocal output_text, interaction_id, new_environment_id, usage
         full_prompt = prompt
-        if needs_refresh and session.gemini_environment_id:
-            history = db.query(ChatMessage).filter(
-                ChatMessage.session_id == session.session_id
-            ).order_by(ChatMessage.created_at.asc()).limit(20).all()
+        if with_history:
+            history = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.session_id == session.session_id)
+                .order_by(ChatMessage.created_at.asc())
+                .limit(20)
+                .all()
+            )
             if history:
                 context = build_context_from_history(history)
-                full_prompt = f"""Previous conversation context:\n\n{context}\n\n---\n\nNew request: {prompt}"""
-
+                full_prompt = (
+                    f"Previous conversation context:\n\n{context}\n\n---\n\n"
+                    f"New request: {prompt}"
+                )
         async for event in gemini_service.create_interaction_streaming(
             prompt=full_prompt,
             gcs_input_path=gcs_input_path,
             gcs_token=gcs_token,
+            images=images,
         ):
             if event.event_type == "complete":
                 output_text = event.message
-                environment_id = event.data.get("environment_id")
+                new_environment_id = event.data.get("environment_id")
                 interaction_id = event.data.get("interaction_id")
+                usage = _usage_from_event_data(event.data)
+            yield event
 
-        if environment_id:
-            session.gemini_environment_id = environment_id
-            session.environment_created_at = datetime.utcnow()
-            session.environment_needs_refresh = False
+    expired_fallback = False
+    if can_continue:
+        try:
+            async for event in _run_continue():
+                yield event
+        except GeminiApiError as e:
+            if not _is_expired_interaction_error(e):
+                raise
+            logger.info(
+                "previous_interaction_id %s appears expired (%s); restarting with history",
+                session.last_interaction_id,
+                e.status_code,
+            )
+            session.last_interaction_id = None
+            expired_fallback = True
 
+    if not can_continue or expired_fallback:
+        # Tell the client we are restarting so the UI can show a refresh chip.
+        if expired_fallback:
+            yield ProgressEvent(
+                event_type="status",
+                message="Previous interaction expired — starting a fresh sandbox with conversation history.",
+                data={"reason": "expired_interaction"},
+            )
+        async for event in _run_create(with_history=needs_refresh or expired_fallback):
+            yield event
+
+    if new_environment_id:
+        session.gemini_environment_id = new_environment_id
+        session.environment_created_at = datetime.utcnow()
+    # Mark refresh consumed regardless of whether we recreated or inlined.
+    if needs_refresh:
+        session.environment_needs_refresh = False
     if interaction_id:
         session.last_interaction_id = interaction_id
+    db.flush()  # Flush changes without closing the session
     db.commit()
 
-    return output_text, interaction_id
+
+async def run_agent_prompt(
+    prompt: str,
+    session: UserSession,
+    db: Session,
+    gemini_service,
+    gcs_service,
+    images: list[dict] | None = None,
+) -> tuple[str, str | None, UsageInfo | None]:
+    """Run a prompt against the session's Gemini environment and update session state.
+
+    Returns (output_text, interaction_id, usage). Drains the underlying SSE stream
+    via :func:`drive_agent_interaction`.
+    """
+    output_text = ""
+    interaction_id: str | None = None
+    usage: UsageInfo | None = None
+
+    async for event in drive_agent_interaction(
+        prompt=prompt,
+        session=session,
+        db=db,
+        gemini_service=gemini_service,
+        gcs_service=gcs_service,
+        images=images,
+    ):
+        if event.event_type == "complete":
+            output_text = event.message
+            interaction_id = event.data.get("interaction_id") or interaction_id
+            usage = _usage_from_event_data(event.data) or usage
+
+    return output_text, interaction_id, usage
 
 
 @router.post(
@@ -457,20 +734,13 @@ async def run_agent_prompt(
 async def send_message(
     session_id: uuid.UUID,
     request: ChatRequest,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
     """Send a chat message to the agent (non-streaming)."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     # Save user message
     user_message = ChatMessage(
@@ -483,18 +753,22 @@ async def send_message(
     db.commit()
 
     try:
-        output_text, interaction_id = await run_agent_prompt(
+        output_text, interaction_id, usage = await run_agent_prompt(
             prompt=build_data_science_prompt(request.message),
             session=session,
             db=db,
             gemini_service=gemini_service,
             gcs_service=gcs_service,
+            images=[img.model_dump() for img in request.images],
         )
+
+        # Re-attach session to database session after async operations
+        merged_session = db.merge(session)
 
         # Save assistant message
         assistant_message = ChatMessage(
             message_id=uuid.uuid4(),
-            session_id=session.session_id,
+            session_id=merged_session.session_id,
             role="assistant",
             content=output_text,
             interaction_id=interaction_id,
@@ -504,7 +778,7 @@ async def send_message(
         db.refresh(assistant_message)
 
         reports, _ = await list_session_reports(
-            session=session,
+            session=merged_session,
             gemini_service=gemini_service,
             gcs_service=gcs_service,
             only_new=True,
@@ -518,6 +792,7 @@ async def send_message(
             content=assistant_message.content,
             created_at=assistant_message.created_at,
             attachments=reports,
+            usage=usage,
         )
 
     except Exception as e:
@@ -538,20 +813,13 @@ async def send_message(
 )
 async def generate_analyst_brief(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
     """Generate a first-pass analyst brief for uploaded session files."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     uploaded_file_count = db.query(UploadedFile).filter(
         UploadedFile.session_id == session_id
@@ -578,7 +846,7 @@ async def generate_analyst_brief(
         )
 
     try:
-        output_text, interaction_id = await run_agent_prompt(
+        output_text, interaction_id, usage = await run_agent_prompt(
             prompt=ANALYST_BRIEF_PROMPT,
             session=session,
             db=db,
@@ -586,9 +854,12 @@ async def generate_analyst_brief(
             gcs_service=gcs_service,
         )
 
+        # Re-attach session to database session after async operations
+        merged_session = db.merge(session)
+
         assistant_message = ChatMessage(
             message_id=uuid.uuid4(),
-            session_id=session.session_id,
+            session_id=merged_session.session_id,
             role="assistant",
             content=output_text,
             interaction_id=interaction_id,
@@ -603,6 +874,7 @@ async def generate_analyst_brief(
             role=assistant_message.role,
             content=assistant_message.content,
             created_at=assistant_message.created_at,
+            usage=usage,
         )
 
     except Exception as e:
@@ -623,20 +895,13 @@ async def generate_analyst_brief(
 async def send_message_stream(
     session_id: uuid.UUID,
     request: ChatRequest,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
     """Send a chat message and stream the response via SSE."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     # Save user message
     user_message = ChatMessage(
@@ -648,113 +913,57 @@ async def send_message_stream(
     db.add(user_message)
     db.commit()
 
-    # Get GCS input path
-    gcs_input_path = gcs_service.get_input_folder_path(
-        tenant_id=session.tenant_id,
-        user_id=str(session.user_id),
-        session_id=str(session.session_id),
-    )
-    gcs_token = gcs_service.get_access_token()
+    images_payload = [img.model_dump() for img in request.images]
 
     async def event_generator():
         """Generate SSE events from Gemini streaming response."""
+        db_inner = SessionLocal()
         try:
+            session_inner = get_owned_session(db_inner, session_id, session_token)
             output_text = ""
-            environment_id = None
-            interaction_id = None
-            complete_event_data = {}
+            interaction_id: str | None = None
+            complete_event_data: dict = {}
 
-            # Check if environment needs refresh due to new file uploads
-            needs_refresh = session.environment_needs_refresh and session.gemini_environment_id
+            async for event in drive_agent_interaction(
+                prompt=build_data_science_prompt(request.message),
+                session=session_inner,
+                db=db_inner,
+                gemini_service=gemini_service,
+                gcs_service=gcs_service,
+                images=images_payload,
+            ):
+                if event.event_type == "complete":
+                    output_text = event.message
+                    interaction_id = (event.data or {}).get("interaction_id") or interaction_id
+                    complete_event_data = event.data or {}
+                    continue
 
-            if session.gemini_environment_id and session.last_interaction_id and not needs_refresh:
-                # Continue existing interaction
-                async for event in gemini_service.continue_interaction_streaming(
-                    prompt=build_data_science_prompt(request.message),
-                    environment_id=session.gemini_environment_id,
-                    previous_interaction_id=session.last_interaction_id,
-                ):
-                    if event.event_type == "complete":
-                        output_text = event.message
-                        environment_id = session.gemini_environment_id
-                        interaction_id = event.data.get("interaction_id")
-                        complete_event_data = event.data or {}
-                        continue
-
-                    event_data = json.dumps({
-                        "event_type": event.event_type,
-                        "message": event.message,
-                        "timestamp": event.timestamp.isoformat(),
-                        "data": event.data,
-                    })
-                    yield f"data: {event_data}\n\n"
-            else:
-                # Create new interaction (or refresh due to new files)
-                full_prompt = build_data_science_prompt(request.message)
-
-                # If refreshing, include chat history as context
-                if needs_refresh and session.gemini_environment_id:
-                    history = db.query(ChatMessage).filter(
-                        ChatMessage.session_id == session.session_id
-                    ).order_by(ChatMessage.created_at.asc()).limit(20).all()
-                    if history:
-                        context = build_context_from_history(history)
-                        full_prompt = f"""Previous conversation context:
-
-{context}
-
----
-
-{full_prompt}"""
-                    yield f'data: {{"event_type": "refresh", "message": "Refreshing environment with new files...", "timestamp": "{datetime.utcnow().isoformat()}"}}\n\n'
-
-                async for event in gemini_service.create_interaction_streaming(
-                    prompt=full_prompt,
-                    gcs_input_path=gcs_input_path,
-                    gcs_token=gcs_token,
-                ):
-                    if event.event_type == "complete":
-                        output_text = event.message
-                        environment_id = event.data.get("environment_id")
-                        interaction_id = event.data.get("interaction_id")
-                        complete_event_data = event.data or {}
-                        continue
-
-                    event_data = json.dumps({
-                        "event_type": event.event_type,
-                        "message": event.message,
-                        "timestamp": event.timestamp.isoformat(),
-                        "data": event.data,
-                    })
-                    yield f"data: {event_data}\n\n"
-
-            # Update session
-            if environment_id:
-                session.gemini_environment_id = environment_id
-                session.environment_created_at = datetime.utcnow()
-                session.environment_needs_refresh = False
-            if interaction_id:
-                session.last_interaction_id = interaction_id
-            db.commit()
+                payload = json.dumps({
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "timestamp": event.timestamp.isoformat(),
+                    "data": event.data,
+                })
+                yield f"data: {payload}\n\n"
 
             reports, harvested_count = await list_session_reports(
-                session=session,
+                session=session_inner,
                 gemini_service=gemini_service,
                 gcs_service=gcs_service,
                 only_new=True,
             )
             reports = filter_reports_by_mentioned_files(reports, output_text)
+            usage = _usage_from_event_data(complete_event_data)
 
-            # Save assistant message
             assistant_message = ChatMessage(
                 message_id=uuid.uuid4(),
-                session_id=session.session_id,
+                session_id=session_inner.session_id,
                 role="assistant",
                 content=output_text,
                 interaction_id=interaction_id,
             )
-            db.add(assistant_message)
-            db.commit()
+            db_inner.add(assistant_message)
+            db_inner.commit()
 
             complete_payload = {
                 "event_type": "complete",
@@ -765,11 +974,13 @@ async def send_message_stream(
                     "interaction_id": interaction_id,
                     "harvested_count": harvested_count,
                     "reports": reports_to_dicts(reports),
+                    "usage": usage.model_dump() if usage else None,
                 },
             }
             yield f"data: {json.dumps(complete_payload)}\n\n"
 
         except Exception as e:
+            db_inner.rollback()
             logger.error(f"Error in streaming: {str(e)}")
             error_data = json.dumps({
                 "event_type": "error",
@@ -777,6 +988,8 @@ async def send_message_stream(
                 "timestamp": datetime.utcnow().isoformat(),
             })
             yield f"data: {error_data}\n\n"
+        finally:
+            db_inner.close()
 
     return StreamingResponse(
         event_generator(),
@@ -800,18 +1013,11 @@ def get_chat_history(
     session_id: uuid.UUID,
     limit: int = 50,
     offset: int = 0,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
 ):
     """Get chat history for a session."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    get_owned_session(db, session_id, session_token)
 
     messages = (
         db.query(ChatMessage)
@@ -843,20 +1049,13 @@ def get_chat_history(
 )
 async def list_reports(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
     """List available reports generated in the session workspace."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     reports, _ = await list_session_reports(
         session=session,
@@ -878,6 +1077,7 @@ async def download_report(
     session_id: uuid.UUID,
     filename: str,
     inline: bool = False,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
@@ -887,15 +1087,7 @@ async def download_report(
     Args:
         inline: If True, serves file inline (for chat images). If False, forces download.
     """
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     content = None
 
@@ -913,7 +1105,12 @@ async def download_report(
         try:
             with tarfile.open(fileobj=tmp, mode="r:*") as tar:
                 for member in tar.getmembers():
-                    if member.name.endswith(filename):
+                    member_filename = os.path.basename(member.name)
+                    if (
+                        member_filename == filename
+                        and is_final_deliverable(member.name, member_filename)
+                        and not is_spurious_output_file(member_filename)
+                    ):
                         f = tar.extractfile(member)
                         if f:
                             content = f.read()
@@ -952,20 +1149,13 @@ async def download_report(
 )
 async def harvest_workspace(
     session_id: uuid.UUID,
+    session_token: str = Depends(session_token_dependency),
     db: Session = Depends(get_db),
     gemini_service=Depends(get_gemini_service),
     gcs_service=Depends(get_gcs_service),
 ):
     """Harvest the workspace snapshot and save to GCS for persistence."""
-    session = db.query(UserSession).filter(
-        UserSession.session_id == session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
+    session = get_owned_session(db, session_id, session_token)
 
     if not session.gemini_environment_id:
         raise HTTPException(

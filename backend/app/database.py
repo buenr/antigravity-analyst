@@ -56,6 +56,14 @@ def _run_migrations():
             conn.commit()
             print("Migration: added environment_needs_refresh to user_sessions")
 
+        # Add missing access_token column for session ownership checks
+        if "access_token" not in existing_columns:
+            conn.execute(text(
+                "ALTER TABLE user_sessions ADD COLUMN access_token VARCHAR(255)"
+            ))
+            conn.commit()
+            print("Migration: added access_token to user_sessions")
+
 
 def init_db():
     """Initialize database tables and run migrations."""
