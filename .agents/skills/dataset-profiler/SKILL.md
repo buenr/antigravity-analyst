@@ -16,3 +16,13 @@ Use this skill whenever a task depends on uploaded data or asks for an analyst b
 5. Flag suspicious values, inconsistent categories, impossible dates, high-cardinality identifiers, likely keys, and potential outliers.
 6. Distinguish verified observations from inferred meanings.
 7. If a file cannot be read, state the filename and the error or limitation.
+
+## Visualization for profiling
+
+When profiling, use these visual checks:
+
+- **Missingness patterns**: Use `missingno.matrix()` or `missingno.heatmap()` to visualize missing data structure (requires Tier 2).
+- **Distributions**: Plot histograms or density plots for numeric columns to identify skew, multimodality, and outliers.
+- **Cardinality**: Bar charts of value counts for categorical columns to spot high-cardinality fields or dominant categories.
+- **Correlations**: Heatmap of pairwise correlations for numeric fields to detect relationships and potential redundancies.
+- **Outliers**: Box plots or violin plots for key numeric fields to visualize spread and extreme values.

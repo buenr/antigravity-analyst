@@ -16,3 +16,24 @@ Use this skill for EDA, comparisons, hypothesis checks, segmentation, correlatio
 5. Avoid causal claims unless the data and design support them.
 6. Quantify uncertainty, effect sizes, and practical significance when possible.
 7. Summarize findings with caveats, limitations, and next analytical steps.
+
+## Visualization for statistical analysis
+
+Choose charts that match the analytical goal:
+
+| Goal | Recommended visualizations |
+|---|---|
+| Compare groups | Box plots, violin plots, bar charts with confidence intervals |
+| Show relationships | Scatter plots with regression lines, pair plots for multivariate |
+| Display distributions | Histograms, density plots, ECDF plots |
+| Correlation matrix | Annotated heatmap with diverging color scale |
+| Time patterns | Line charts with trend indicators, seasonal decomposition plots |
+| Segment comparison | Faceted small multiples, grouped bar charts |
+
+### Best practices
+
+- **Confidence intervals**: Always show uncertainty in bar charts and line plots (error bars, ribbons).
+- **Effect size visualization**: Use forest plots or Cohen's d annotations for group comparisons.
+- **Multivariate relationships**: Use `seaborn.pairplot()` or `seaborn.PairGrid()` for pairwise scatter matrices.
+- **Faceting**: Small multiples (facet wrap/grid) compare patterns across subgroups without overloading a single chart.
+- **Annotation**: Mark statistical significance with clear symbols or labels; explain test results in captions.

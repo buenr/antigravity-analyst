@@ -92,6 +92,96 @@ Run `bash .agents/bootstrap_packages.sh 4` when the user asks for PDF, PowerPoin
 
 To install every tier at once: `bash .agents/bootstrap_packages.sh all`
 
+## Data visualization guidelines
+
+Follow these principles for clear, effective, and accessible visualizations.
+
+### Chart selection
+
+| Data relationship | Recommended charts |
+|---|---|
+| Part-to-whole | Pie (few categories), stacked bar, treemap |
+| Comparison (few categories) | Bar chart, grouped bar |
+| Comparison (many categories) | Sorted bar, dot plot, lollipop |
+| Change over time | Line chart, area chart, slope chart (few periods) |
+| Distribution | Histogram, density, box plot, violin, ridge plot |
+| Correlation | Scatter plot, bubble plot, heatmap |
+| Ranking | Sorted bar, dot plot |
+| Geographic | Choropleth map, bubble map |
+
+### Style and clarity
+
+1. **Titles and labels**: Every chart needs a descriptive title, axis labels with units, and a legend when using multiple series or categories.
+2. **Colorblind safety**: Use colorblind-friendly palettes (`seaborn.color_palette("colorblind")` or Plotly's `template="plotly_white"`). Avoid red-green contrasts. Use patterns or shapes as secondary encodings when color alone may be insufficient.
+3. **Readability**: Set font sizes ≥ 10pt for labels, ≥ 12pt for titles. Rotate tick labels if they overlap. Avoid 3D effects, excessive gridlines, and chartjunk.
+4. **Aspect ratio**: Match aspect ratio to the data pattern—wider for time series, square for scatter plots, tall for bar charts with many categories.
+5. **Annotations**: Highlight key data points, thresholds, or events with text annotations rather than expecting the viewer to infer them.
+
+### Chart-specific tips
+
+**Bar charts**
+- Start the y-axis at zero for quantity comparisons.
+- Sort bars by value (descending or ascending) unless there is a natural ordering (time, age groups).
+- Use horizontal bars when category names are long or there are many categories.
+
+**Line charts**
+- Show data points as markers when there are few observations.
+- Use consistent line styles and annotate directly rather than relying solely on a legend.
+- For multiple series, limit to 4-5 lines to maintain clarity.
+
+**Scatter plots**
+- Add trend lines or LOESS curves to show relationships.
+- Use transparency (`alpha`) to reveal overplotting.
+- Consider marginal histograms or density plots for bivariate distributions.
+
+**Histograms and distributions**
+- Choose bin sizes that reveal shape without over-smoothing or over-detailing.
+- Overlay density curves for smooth comparisons.
+- Use stacked or faceted histograms for comparing groups.
+
+**Heatmaps**
+- Include a colorbar with clear labels.
+- Use diverging palettes for data with a meaningful midpoint (correlations, change from baseline).
+- Annotate cells with values for small matrices.
+
+**Time series**
+- Mark events, regime changes, or forecast origins with vertical lines or shaded regions.
+- Separate historical data, fitted values, and forecasts with distinct styles.
+- Show prediction intervals or confidence bands when available.
+
+### Interactivity vs. static
+
+| Format | Tool | When to use |
+|---|---|---|
+| Static PNG/PDF | `matplotlib`, `seaborn`, `plotly` + `kaleido` | Reports, slides, print |
+| Interactive HTML | `plotly`, `altair` | Exploratory analysis, dashboards, web embeds |
+| Animated | `plotly` animation frames | Temporal evolution, transitions |
+
+For deliverables in `./outputs/`, prefer static formats unless interactivity is explicitly requested. Use `plotly` with `kaleido` for high-quality static exports:
+
+```python
+import plotly.express as px
+fig = px.scatter(df, x="x", y="y", title="Title")
+fig.write_image("./outputs/chart.png", scale=2)  # scale=2 for retina quality
+fig.write_html("./outputs/chart.html")  # optional interactive version
+```
+
+### Accessibility
+
+1. **Contrast**: Ensure sufficient contrast between chart elements and background (WCAG AA: 4.5:1 for text).
+2. **Text alternatives**: Write figure captions that convey the main insight for screen readers.
+3. **Pattern encoding**: Use different line styles (solid, dashed, dotted) and marker shapes in addition to color.
+4. **Font scaling**: Test that charts remain readable when scaled up 200% for users with low vision.
+
+### Common mistakes to avoid
+
+- Pie charts with more than 5-6 slices (use bar charts instead).
+- Dual y-axes (misleading; use faceted plots or secondary chart).
+- 3D charts for 2D data (distorts perception; use 2D alternatives).
+- Overloaded charts with too many series or categories (facet or simplify).
+- Logarithmic axes without clear labeling (explicitly state "log scale").
+- Decorative elements that do not convey information (chartjunk).
+
 ## Default workflow
 
 1. On a fresh sandbox, run Tier 1 bootstrap if markers are missing.
