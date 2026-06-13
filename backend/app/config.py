@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # Gemini API
     gemini_api_key: str
     gemini_agent_name: str = "antigravity-preview-05-2026"
+    gemini_data_profiler_agent_name: Optional[str] = None
+    gemini_statistician_agent_name: Optional[str] = None
+    gemini_ml_reviewer_agent_name: Optional[str] = None
+    gemini_forecasting_reviewer_agent_name: Optional[str] = None
+    gemini_deliverable_builder_agent_name: Optional[str] = None
     gemini_system_instruction: str = (
         "You are a specialized data scientist and analyst. Use mounted "
         "AGENTS.md instructions and skills, inspect real uploaded data before "

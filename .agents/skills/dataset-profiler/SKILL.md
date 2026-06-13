@@ -12,10 +12,14 @@ Use this skill whenever a task depends on uploaded data or asks for an analyst b
 1. Install Tier 1 (`bash .agents/bootstrap_packages.sh 1`); add Tier 2 for `missingno` or large-file profiling with `pyarrow`.
 2. List files under `/workspace/data` and identify readable formats.
 3. Load each dataset with safe, format-aware readers.
-4. Report shape, columns, inferred types, sample rows, missingness, duplicate counts, and obvious parsing issues.
-5. Flag suspicious values, inconsistent categories, impossible dates, high-cardinality identifiers, likely keys, and potential outliers.
-6. Distinguish verified observations from inferred meanings.
-7. If a file cannot be read, state the filename and the error or limitation.
+4. Identify the apparent business grain of each dataset, such as one row per customer, order, transaction, account, product, date, or event.
+5. Report shape, columns, inferred types, sample rows, missingness, duplicate counts, and obvious parsing issues.
+6. Flag suspicious values, inconsistent categories, impossible dates, high-cardinality identifiers, likely keys, and potential outliers.
+7. Identify likely measures, dimensions, dates, IDs, KPI candidates, and join keys, labeling inferred meanings as guesses.
+8. Summarize data readiness: what can be analyzed now, what needs cleaning, and which quality risks could change business conclusions.
+9. Recommend practical cleaning or validation steps, such as standardizing categories, handling missing values, deduplicating records, or confirming definitions.
+10. Distinguish verified observations from inferred meanings.
+11. If a file cannot be read, state the filename and the error or limitation.
 
 ## Visualization for profiling
 

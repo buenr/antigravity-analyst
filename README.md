@@ -90,6 +90,10 @@ The app will be available at http://localhost:5173
    - "Summarize the data and find outliers"
    - "Create a scatter plot of column A vs column B"
    - "Generate a PDF report with key statistics"
+   - "Profile this dataset for KPI candidates, dimensions, and data-readiness risks"
+   - "Find the main revenue drivers and explain the business impact"
+   - "Analyze churn risk and identify the segments that need attention"
+   - "Create an executive summary with charts and next-step recommendations"
 6. When the agent creates deliverables (PDF, PNG, CSV, etc.), **Download** links appear under that chat reply automatically
 7. Use the **Reports** tab to browse all downloadable files for the session
 

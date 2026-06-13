@@ -381,6 +381,7 @@ class GeminiService:
         gcs_input_path: str,
         gcs_token: Optional[str] = None,
         images: Optional[list[dict]] = None,
+        agent_name: Optional[str] = None,
     ) -> tuple[str, str]:
         """Create a new interaction with a fresh sandbox.
 
@@ -388,7 +389,7 @@ class GeminiService:
         """
         async with httpx.AsyncClient(timeout=300.0) as client:
             payload = {
-                "agent": settings.gemini_agent_name,
+                "agent": agent_name or settings.gemini_agent_name,
                 "input": _build_input(prompt, images),
                 "system_instruction": settings.gemini_system_instruction,
                 "environment": _build_environment(gcs_input_path, gcs_token),
@@ -414,6 +415,7 @@ class GeminiService:
         gcs_token: Optional[str] = None,
         environment_id: Optional[str] = None,
         images: Optional[list[dict]] = None,
+        agent_name: Optional[str] = None,
     ) -> AsyncGenerator[ProgressEvent, None]:
         """Create a new interaction with SSE streaming.
 
@@ -425,7 +427,7 @@ class GeminiService:
         """
         async with httpx.AsyncClient(timeout=300.0) as client:
             payload = {
-                "agent": settings.gemini_agent_name,
+                "agent": agent_name or settings.gemini_agent_name,
                 "input": _build_input(prompt, images),
                 "system_instruction": settings.gemini_system_instruction,
                 "environment": (
@@ -454,6 +456,7 @@ class GeminiService:
         environment_id: str,
         previous_interaction_id: str,
         images: Optional[list[dict]] = None,
+        agent_name: Optional[str] = None,
     ) -> AsyncGenerator[ProgressEvent, None]:
         """Continue an existing interaction with SSE streaming.
 
@@ -461,7 +464,7 @@ class GeminiService:
         """
         async with httpx.AsyncClient(timeout=300.0) as client:
             payload = {
-                "agent": settings.gemini_agent_name,
+                "agent": agent_name or settings.gemini_agent_name,
                 "input": _build_input(prompt, images),
                 "system_instruction": settings.gemini_system_instruction,
                 "environment": environment_id,

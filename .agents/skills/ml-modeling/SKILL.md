@@ -10,12 +10,14 @@ Use this skill for classification, regression, clustering, ranking, or model eva
 ## Procedure
 
 1. Install Tier 1 and Tier 2 (`bash .agents/bootstrap_packages.sh 2`).
-2. Identify the target, prediction unit, available features, and success metric.
+2. Identify the target, prediction unit, business decision, available features, and success metric.
 3. Check for target leakage, duplicated entities across splits, temporal leakage, and post-outcome fields.
-4. Build a simple baseline before more complex models.
+4. Build a simple baseline before more complex models, and compare improvements against a business-relevant benchmark.
 5. Choose validation strategy based on data structure: random, stratified, grouped, or chronological.
-6. Use appropriate metrics and include confusion matrices, residual checks, feature importance, or calibration when relevant.
-7. Report limitations, likely failure modes, and recommendations for production use only if requested.
+6. Use appropriate metrics and connect them to consequences such as false positives, false negatives, forecast error, missed revenue, cost, or service risk.
+7. Include confusion matrices, residual checks, feature importance, calibration, or segment performance when relevant.
+8. Report limitations, likely failure modes, data drift risks, fairness or subgroup concerns when visible, and recommendations for production use only if requested.
+9. Avoid implying deployment readiness from a notebook-style model; describe it as exploratory unless the user asks for production planning.
 
 ## Visualization for ML
 

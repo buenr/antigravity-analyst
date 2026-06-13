@@ -121,6 +121,22 @@ class UsageInfo(BaseModel):
     total_tool_use_tokens: Optional[int] = None
 
 
+class AnalysisContract(BaseModel):
+    """Structured summary extracted from an assistant analytical response."""
+
+    findings: List[str] = Field(default_factory=list)
+    assumptions: List[str] = Field(default_factory=list)
+    data_quality: List[str] = Field(default_factory=list)
+    methods: List[str] = Field(default_factory=list)
+    limitations: List[str] = Field(default_factory=list)
+    artifacts: List[str] = Field(default_factory=list)
+    valid: bool = Field(
+        default=False,
+        description="True when all required contract sections were present.",
+    )
+    missing_sections: List[str] = Field(default_factory=list)
+
+
 class ChatRequest(BaseModel):
     """Request to send a chat message."""
 
@@ -148,6 +164,10 @@ class ChatMessageResponse(BaseModel):
     usage: Optional[UsageInfo] = Field(
         default=None,
         description="Token usage reported for this turn",
+    )
+    analysis_contract: Optional[AnalysisContract] = Field(
+        default=None,
+        description="Parsed analytical output contract when present.",
     )
 
     class Config:

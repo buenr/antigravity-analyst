@@ -13,9 +13,11 @@ Use this skill when the user asks for a downloadable report, chart, table, expor
 2. Create `./outputs/` before writing final deliverables.
 3. Save only final user-facing files in `./outputs/`.
 4. Keep temporary files, intermediate chart components, cleaned working files, and scratch notebooks outside `./outputs/`.
-5. Use clear, stable basenames such as `analysis_report.pdf`, `summary_table.csv`, or `forecast_chart.png`.
-6. Validate that each final file exists and is readable.
-7. In the final response, mention each deliverable by basename only and do not invent download links.
+5. Match the deliverable to the audience: executive summaries should lead with decisions, business impact, and recommended actions; technical appendices can carry methods and diagnostics.
+6. Structure reports with a concise executive summary, key findings, data/method notes, limitations, and practical actionable recommendations.
+7. Use clear, stable basenames such as `analysis_report.pdf`, `summary_table.csv`, or `forecast_chart.png`.
+8. Validate that each final file exists and is readable.
+9. In the final response, mention each deliverable by basename only and do not invent download links.
 
 ## Visualization export checklist
 
@@ -23,23 +25,30 @@ Before exporting a chart as a deliverable, verify:
 
 ### Content quality
 - [ ] Descriptive title that states the main insight
+- [ ] Audience and decision context are clear enough for the viewer
+- [ ] Chart type matches the relationship being shown (comparison, trend, distribution, relationship, ranking, or part-to-whole)
 - [ ] Axis labels with units (e.g., "Revenue ($M)", "Time (months)")
 - [ ] Legend present and positioned to avoid overlap
 - [ ] Data source noted in caption or footer
 - [ ] Key takeaways annotated directly on the chart
+- [ ] The chart supports one primary message or has been split into simpler views
 
 ### Visual quality
 - [ ] Font sizes readable at export size (≥10pt labels, ≥12pt title)
 - [ ] Colorblind-friendly palette used
+- [ ] Color is used strategically to highlight, group, or compare; meaning does not depend on color alone
 - [ ] Sufficient contrast for print (test grayscale if printing)
 - [ ] No overlapping labels or legend items
 - [ ] Appropriate aspect ratio for content
+- [ ] Bar charts use a zero baseline unless the exception is justified and clearly labeled
+- [ ] No misleading scales, unlabeled transformations, clutter, chartjunk, or unnecessary decorative elements
 
 ### Technical quality
 - [ ] Resolution sufficient for medium (300 DPI for print, 150 DPI for screens)
 - [ ] Vector format (PDF/SVG) for reports and slides when possible
 - [ ] PNG with transparent background if overlaying on colored slides
 - [ ] Reasonable file size for email/attachment limits
+- [ ] Interactive HTML deliverables, when requested, include useful filters, slicers, hover details, or drill-downs without hiding the default key insight
 
 ### Export commands
 

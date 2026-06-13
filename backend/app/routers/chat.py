@@ -17,12 +17,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.auth import get_owned_session, session_token_dependency
+from app.config import get_settings
 from app.database import get_db, SessionLocal
 from app.models import ChatMessage, UploadedFile, UserSession
 from app.schemas import (
     ChatMessageResponse,
     ChatRequest,
     ErrorResponse,
+    AnalysisContract,
     DownloadResponse,
     ImageInput,
     ProgressEvent,
@@ -34,6 +36,17 @@ from app.services.gemini_service import GeminiApiError, get_gemini_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+ANALYSIS_CONTRACT_SECTIONS = (
+    "findings",
+    "assumptions",
+    "data_quality",
+    "methods",
+    "limitations",
+    "artifacts",
+)
 
 
 REPORT_EXTENSIONS = (
@@ -57,7 +70,7 @@ REPORT_EXTENSIONS = (
 )
 
 
-ANALYST_BRIEF_PROMPT = """You are a careful data analyst. Inspect the uploaded files mounted at /workspace/data and write a concise first-pass analyst brief.
+ANALYST_BRIEF_PROMPT = """You are a careful business analyst and data scientist. Inspect the uploaded files mounted at /workspace/data and write a concise first-pass analyst brief.
 
 Before inspecting data: ensure Tier 1 packages are installed by running `bash .agents/bootstrap_packages.sh 1` if needed (see `.agents/AGENTS.md`). Do not mention bootstrap in the brief unless installation failed.
 
@@ -65,27 +78,52 @@ Include:
 - Dataset names, row counts, column counts, and important columns when you can determine them.
 - Likely meanings of the columns, but label guesses as guesses.
 - Missingness, duplicates, suspicious values, type issues, and potential outliers.
+- Apparent business grain (for example, customer, order, transaction, product, date, event), likely keys, and likely join paths.
+- Likely KPI candidates, measures, dimensions, date fields, and segments that could support business analysis.
+- Data-readiness risks that could affect conclusions, such as missing definitions, inconsistent categories, incomplete time windows, duplicate entities, or questionable outliers.
+- Practical next analyses, such as KPI profiling, driver analysis, segmentation, churn/risk analysis, forecasting, or executive reporting when relevant.
 - 3 to 5 useful follow-up questions the user can ask next.
 
-Do not invent conclusions beyond what you can inspect. If a file cannot be read, say which file and why. Keep the brief practical and easy to scan."""
+Do not invent conclusions beyond what you can inspect. If a file cannot be read, say which file and why. Keep the brief practical and easy to scan.
+
+End your response with this exact markdown analysis contract, using every heading even when the value is "None":
+## Findings
+## Assumptions
+## Data Quality
+## Methods
+## Limitations
+## Artifacts"""
 
 
-DATA_SCIENCE_PROMPT_TEMPLATE = """You are a rigorous data scientist working in a Python sandbox with the uploaded files in /workspace/data.
+DATA_SCIENCE_PROMPT_TEMPLATE = """You are a rigorous business analyst, data scientist, and report writer working in a Python sandbox with the uploaded files in /workspace/data.
 
 Before answering:
 1. Ensure required Python packages are installed per `.agents/AGENTS.md` (Tier 1 always; higher tiers on demand via `bash .agents/bootstrap_packages.sh <tier>`).
-2. Inspect the actual files, schemas, row counts, column types, missing values, and sample rows.
-3. State assumptions clearly and do not invent conclusions.
-4. For ML tasks, identify the target column, check for leakage, choose an appropriate train/test split, build a simple baseline first, then compare better models only if useful.
-5. Report metrics appropriate to the task: classification, regression, clustering, or forecasting.
-6. Save final requested deliverables inside a directory named `./outputs/` (relative to your current working directory).
+2. Inspect the actual files before drawing conclusions: schemas, row counts, column types, missing values, duplicates, suspicious values, outliers, sample rows, likely keys, and apparent business grain.
+3. Identify the user's business question, audience, decision, KPI, or success metric when available. If essential context is missing, ask a concise clarification; otherwise proceed with explicit assumptions.
+4. Clean, wrangle, filter, join, or aggregate data only as needed for the request, and state important transformations or exclusions.
+5. Choose methods that fit the question and data: descriptive analysis, statistical tests, segmentation, visualization, forecasting, or machine learning.
+6. For statistical work, report uncertainty, effect size, and practical significance when possible; avoid causal claims unless the data supports them.
+7. For ML tasks, identify the target column, prediction unit, business metric, leakage risks, validation strategy, and simple baseline before comparing better models.
+8. For forecasting tasks, use chronological validation, baseline forecasts, horizon assumptions, and uncertainty intervals where feasible.
+9. Create clear, accurate, accessible visualizations when they help: know the audience, choose the right chart type, keep visuals simple, label axes and units, use legends when needed, use color strategically, avoid relying on color alone, start bar charts at zero unless clearly justified, avoid misleading scales or clutter, and use annotations to guide attention to key takeaways.
+10. Communicate like a business analyst: lead with findings, explain the business impact, connect results to practical actions, and preserve caveats and limitations.
+11. State assumptions clearly and do not invent conclusions, data values, filenames, metrics, citations, URLs, or download links.
+12. Save final requested deliverables inside a directory named `./outputs/` (relative to your current working directory).
    - Create the `./outputs/` directory first if it does not exist.
    - Always place the final user-facing files (e.g., a compiled PDF report, a PowerPoint presentation, or a final clean summary CSV) in `./outputs/`.
    - Leave all raw plotting images, temporary cleanups, and scratchpad files in the root directory or `./tmp/`. Do not put intermediate building blocks in `./outputs/`.
-7. When the user asks for a downloadable artifact (PDF, chart image, export, etc.):
+13. When the user asks for a downloadable artifact (PDF, chart image, export, etc.):
    - Save it under `./outputs/` with a clear basename (e.g. `revenue_chart.png`, `analysis_report.pdf`).
    - In your final answer, name each deliverable file exactly as saved (basename only).
    - Do not invent URLs, session IDs, or download links; the application attaches download links automatically.
+14. End every final response with this exact markdown analysis contract, using every heading even when the value is "None":
+   ## Findings
+   ## Assumptions
+   ## Data Quality
+   ## Methods
+   ## Limitations
+   ## Artifacts
 
 User request:
 {user_prompt}"""
@@ -94,6 +132,96 @@ User request:
 def build_data_science_prompt(user_prompt: str) -> str:
     """Wrap user requests with lightweight data-science operating instructions."""
     return DATA_SCIENCE_PROMPT_TEMPLATE.format(user_prompt=user_prompt)
+
+
+def _configured_agent_name(agent_name: str | None) -> str:
+    return agent_name or settings.gemini_agent_name
+
+
+def select_specialist_agent(user_prompt: str, *, is_brief: bool = False) -> tuple[str, str]:
+    """Route a request to a specialist managed agent when one is configured."""
+    prompt = user_prompt.lower()
+    if is_brief:
+        return "data-profiler", _configured_agent_name(settings.gemini_data_profiler_agent_name)
+
+    deliverable_terms = (
+        "report", "pdf", "powerpoint", "ppt", "slide", "docx", "word",
+        "export", "download", "dashboard", "chart", "visualization", "plot",
+    )
+    forecasting_terms = (
+        "forecast", "time series", "timeseries", "seasonal", "seasonality",
+        "backtest", "trend", "future", "projection",
+    )
+    ml_terms = (
+        "model", "predict", "classification", "classifier", "regression",
+        "cluster", "clustering", "feature importance", "auc", "accuracy",
+        "train", "test split", "leakage",
+    )
+    stats_terms = (
+        "correlation", "hypothesis", "significant", "p-value",
+        "confidence interval", "anova", "t-test", "statistical", "segment",
+        "compare",
+    )
+    profile_terms = (
+        "profile", "summarize", "summary", "missing", "duplicates",
+        "outliers", "schema", "columns", "quality", "brief",
+    )
+
+    if any(term in prompt for term in deliverable_terms):
+        return "deliverable-builder", _configured_agent_name(settings.gemini_deliverable_builder_agent_name)
+    if any(term in prompt for term in forecasting_terms):
+        return "forecasting-reviewer", _configured_agent_name(settings.gemini_forecasting_reviewer_agent_name)
+    if any(term in prompt for term in ml_terms):
+        return "ml-reviewer", _configured_agent_name(settings.gemini_ml_reviewer_agent_name)
+    if any(term in prompt for term in stats_terms):
+        return "statistician", _configured_agent_name(settings.gemini_statistician_agent_name)
+    if any(term in prompt for term in profile_terms):
+        return "data-profiler", _configured_agent_name(settings.gemini_data_profiler_agent_name)
+    return "data-analyst", settings.gemini_agent_name
+
+
+def _normalize_contract_heading(heading: str) -> str | None:
+    normalized = re.sub(r"[^a-z_ ]", "", heading.lower()).strip().replace(" ", "_")
+    return normalized if normalized in ANALYSIS_CONTRACT_SECTIONS else None
+
+
+def _section_items(section_text: str) -> list[str]:
+    items: list[str] = []
+    for raw_line in section_text.strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+[.)]\s+", "", line)
+        if line and line.lower() not in {"none", "n/a", "na"}:
+            items.append(line)
+    return items
+
+
+def parse_analysis_contract(text: str) -> AnalysisContract:
+    """Extract the required markdown analysis contract from assistant text."""
+    sections: dict[str, list[str]] = {name: [] for name in ANALYSIS_CONTRACT_SECTIONS}
+    matches = list(re.finditer(r"(?m)^#{2,3}\s+(.+?)\s*$", text or ""))
+
+    for index, match in enumerate(matches):
+        section_name = _normalize_contract_heading(match.group(1))
+        if not section_name:
+            continue
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        sections[section_name] = _section_items(text[start:end])
+
+    present = {
+        _normalize_contract_heading(match.group(1))
+        for match in matches
+        if _normalize_contract_heading(match.group(1))
+    }
+    missing = [name for name in ANALYSIS_CONTRACT_SECTIONS if name not in present]
+    return AnalysisContract(
+        **sections,
+        valid=not missing,
+        missing_sections=missing,
+    )
 
 
 def is_downloadable_report(filename: str) -> bool:
@@ -540,6 +668,8 @@ async def drive_agent_interaction(
     gemini_service,
     gcs_service,
     images: list[dict] | None = None,
+    agent_name: str | None = None,
+    agent_role: str | None = None,
 ) -> AsyncGenerator[ProgressEvent, None]:
     """Single source of truth for routing a prompt to Gemini.
 
@@ -571,6 +701,8 @@ async def drive_agent_interaction(
         session_id=str(session.session_id),
     )
     gcs_token = gcs_service.get_access_token()
+    selected_agent = agent_name or settings.gemini_agent_name
+    selected_role = agent_role or "data-analyst"
 
     needs_refresh = bool(
         session.environment_needs_refresh and session.gemini_environment_id
@@ -614,11 +746,14 @@ async def drive_agent_interaction(
             environment_id=session.gemini_environment_id,
             previous_interaction_id=session.last_interaction_id,
             images=combined_images,
+            agent_name=selected_agent,
         ):
             if event.event_type == "complete":
                 output_text = event.message
                 interaction_id = event.data.get("interaction_id")
                 usage = _usage_from_event_data(event.data)
+                event.data["agent_name"] = selected_agent
+                event.data["agent_role"] = selected_role
             yield event
 
     async def _run_create(with_history: bool) -> AsyncGenerator[ProgressEvent, None]:
@@ -643,12 +778,15 @@ async def drive_agent_interaction(
             gcs_input_path=gcs_input_path,
             gcs_token=gcs_token,
             images=images,
+            agent_name=selected_agent,
         ):
             if event.event_type == "complete":
                 output_text = event.message
                 new_environment_id = event.data.get("environment_id")
                 interaction_id = event.data.get("interaction_id")
                 usage = _usage_from_event_data(event.data)
+                event.data["agent_name"] = selected_agent
+                event.data["agent_role"] = selected_role
             yield event
 
     expired_fallback = False
@@ -697,6 +835,8 @@ async def run_agent_prompt(
     gemini_service,
     gcs_service,
     images: list[dict] | None = None,
+    agent_name: str | None = None,
+    agent_role: str | None = None,
 ) -> tuple[str, str | None, UsageInfo | None]:
     """Run a prompt against the session's Gemini environment and update session state.
 
@@ -714,6 +854,8 @@ async def run_agent_prompt(
         gemini_service=gemini_service,
         gcs_service=gcs_service,
         images=images,
+        agent_name=agent_name,
+        agent_role=agent_role,
     ):
         if event.event_type == "complete":
             output_text = event.message
@@ -753,6 +895,7 @@ async def send_message(
     db.commit()
 
     try:
+        agent_role, agent_name = select_specialist_agent(request.message)
         output_text, interaction_id, usage = await run_agent_prompt(
             prompt=build_data_science_prompt(request.message),
             session=session,
@@ -760,7 +903,10 @@ async def send_message(
             gemini_service=gemini_service,
             gcs_service=gcs_service,
             images=[img.model_dump() for img in request.images],
+            agent_name=agent_name,
+            agent_role=agent_role,
         )
+        analysis_contract = parse_analysis_contract(output_text)
 
         # Re-attach session to database session after async operations
         merged_session = db.merge(session)
@@ -793,6 +939,7 @@ async def send_message(
             created_at=assistant_message.created_at,
             attachments=reports,
             usage=usage,
+            analysis_contract=analysis_contract,
         )
 
     except Exception as e:
@@ -843,16 +990,21 @@ async def generate_analyst_brief(
             role=existing_assistant_message.role,
             content=existing_assistant_message.content,
             created_at=existing_assistant_message.created_at,
+            analysis_contract=parse_analysis_contract(existing_assistant_message.content),
         )
 
     try:
+        agent_role, agent_name = select_specialist_agent("analyst brief", is_brief=True)
         output_text, interaction_id, usage = await run_agent_prompt(
             prompt=ANALYST_BRIEF_PROMPT,
             session=session,
             db=db,
             gemini_service=gemini_service,
             gcs_service=gcs_service,
+            agent_name=agent_name,
+            agent_role=agent_role,
         )
+        analysis_contract = parse_analysis_contract(output_text)
 
         # Re-attach session to database session after async operations
         merged_session = db.merge(session)
@@ -875,6 +1027,7 @@ async def generate_analyst_brief(
             content=assistant_message.content,
             created_at=assistant_message.created_at,
             usage=usage,
+            analysis_contract=analysis_contract,
         )
 
     except Exception as e:
@@ -914,6 +1067,7 @@ async def send_message_stream(
     db.commit()
 
     images_payload = [img.model_dump() for img in request.images]
+    agent_role, agent_name = select_specialist_agent(request.message)
 
     async def event_generator():
         """Generate SSE events from Gemini streaming response."""
@@ -931,6 +1085,8 @@ async def send_message_stream(
                 gemini_service=gemini_service,
                 gcs_service=gcs_service,
                 images=images_payload,
+                agent_name=agent_name,
+                agent_role=agent_role,
             ):
                 if event.event_type == "complete":
                     output_text = event.message
@@ -954,6 +1110,7 @@ async def send_message_stream(
             )
             reports = filter_reports_by_mentioned_files(reports, output_text)
             usage = _usage_from_event_data(complete_event_data)
+            analysis_contract = parse_analysis_contract(output_text)
 
             assistant_message = ChatMessage(
                 message_id=uuid.uuid4(),
@@ -975,6 +1132,9 @@ async def send_message_stream(
                     "harvested_count": harvested_count,
                     "reports": reports_to_dicts(reports),
                     "usage": usage.model_dump() if usage else None,
+                    "analysis_contract": analysis_contract.model_dump(),
+                    "agent_name": agent_name,
+                    "agent_role": agent_role,
                 },
             }
             yield f"data: {json.dumps(complete_payload)}\n\n"
@@ -1035,6 +1195,9 @@ def get_chat_history(
             role=m.role,
             content=m.content,
             created_at=m.created_at,
+            analysis_contract=(
+                parse_analysis_contract(m.content) if m.role == "assistant" else None
+            ),
         )
         for m in messages
     ]

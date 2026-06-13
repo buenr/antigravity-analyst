@@ -10,12 +10,14 @@ Use this skill for EDA, comparisons, hypothesis checks, segmentation, correlatio
 ## Procedure
 
 1. Install Tier 1 (`bash .agents/bootstrap_packages.sh 1`); add Tier 2 when deeper profiling is needed.
-2. Confirm analytical question, population, grain, and relevant filters.
+2. Confirm analytical question, decision context, population, grain, KPI definitions, and relevant filters.
 3. Compute descriptive statistics and visualize important distributions or relationships.
 4. Use statistical tests or intervals only when assumptions are reasonable; state those assumptions.
 5. Avoid causal claims unless the data and design support them.
-6. Quantify uncertainty, effect sizes, and practical significance when possible.
-7. Summarize findings with caveats, limitations, and next analytical steps.
+6. Quantify uncertainty, effect sizes, and practical significance when possible; do not rely on p-values alone.
+7. Translate results into decision language: what changed, how large it is, who or what is affected, and whether it is meaningful for the business.
+8. Explain methods in non-technical language after the findings, with enough detail for a technical reviewer to understand assumptions.
+9. Summarize findings with caveats, limitations, recommended actions, and next analytical steps.
 
 ## Visualization for statistical analysis
 

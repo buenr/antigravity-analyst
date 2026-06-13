@@ -70,17 +70,19 @@ async def cleanup_expired_sessions():
                 )
 
                 # Delete related database records
+                # Convert UUID to string for SQLite compatibility
+                session_id_str = str(session_id)
                 db.execute(
                     text("DELETE FROM chat_messages WHERE session_id = :sid"),
-                    {"sid": session_id},
+                    {"sid": session_id_str},
                 )
                 db.execute(
                     text("DELETE FROM uploaded_files WHERE session_id = :sid"),
-                    {"sid": session_id},
+                    {"sid": session_id_str},
                 )
                 db.execute(
                     text("DELETE FROM user_sessions WHERE session_id = :sid"),
-                    {"sid": session_id},
+                    {"sid": session_id_str},
                 )
 
                 db.commit()

@@ -10,12 +10,14 @@ Use this skill for time-series diagnostics, forecasting, trend analysis, seasona
 ## Procedure
 
 1. Install Tier 1 and Tier 3 (`bash .agents/bootstrap_packages.sh 3`); use `statsmodels` baselines from Tier 1 first.
-2. Identify the timestamp column, target measure, entity grain, frequency, and forecast horizon.
+2. Identify the planning use case, timestamp column, target measure, entity grain, frequency, forecast horizon, and acceptable error for the business decision.
 3. Sort chronologically, inspect missing periods, duplicated timestamps, and calendar effects.
 4. Never use random splits for forecasting. Use chronological holdouts or rolling-origin backtests.
 5. Establish naive baselines such as last value, moving average, or seasonal naive before advanced models.
-6. Report forecast accuracy with scale-appropriate metrics and include uncertainty where feasible.
-7. Clearly separate historical observations, fitted values, and future forecasts.
+6. Report forecast accuracy with scale-appropriate metrics and explain what the error means operationally.
+7. Include uncertainty where feasible and explain that wider intervals imply more planning risk.
+8. State horizon assumptions, seasonality/calendar assumptions, known shocks, and whether external drivers are missing.
+9. Clearly separate historical observations, fitted values, and future forecasts.
 
 ## Visualization for forecasting
 
